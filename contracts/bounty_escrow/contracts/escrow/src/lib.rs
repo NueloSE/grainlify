@@ -1,4 +1,15 @@
 #![no_std]
+//! Bounty escrow contract for locking, releasing, and refunding funds under deterministic rules.
+//!
+//! # Front-running model
+//! The contract assumes contending actions are submitted as separate transactions and resolved by
+//! chain ordering. The first valid state transition on a `bounty_id` wins; subsequent conflicting
+//! operations must fail without moving additional funds.
+//!
+//! # Security model
+//! - Reentrancy protections are applied on state-changing paths.
+//! - CEI (checks-effects-interactions) is used on critical transfer flows.
+//! - Public functions return stable errors for invalid post-transition races.
 #[allow(dead_code)]
 mod events;
 mod invariants;
@@ -1877,11 +1888,15 @@ impl BountyEscrowContract {
         Ok(())
     }
 
-    /// Lock funds for a specific bounty.
-    /// Lock funds for a bounty. When `non_transferable_rewards` is true, the escrow is marked
-    /// as using soulbound/non-transferable tokens; the token contract must disallow further
-    /// transfers after the recipient claims. Claim and release still perform a single transfer
-    /// from the contract to the recipient; no further transfers are required.
+    /// Locks funds for a bounty and records escrow state.
+    ///
+    /// # Security
+    /// - Validation order is deterministic to avoid ambiguous failure behavior under contention.
+    /// - Reentrancy guard is acquired before validation and released on completion.
+    ///
+    /// # Errors
+    /// Returns `Error` variants for initialization, policy, authorization, and duplicate-bounty
+    /// failures.
     pub fn lock_funds(
         env: Env,
         depositor: Address,
@@ -2194,8 +2209,17 @@ impl BountyEscrowContract {
         Ok(())
     }
 
-    /// Release funds to the contributor.
-    /// Only the admin (backend) can authorize this.
+    /// Releases escrowed funds to a contributor.
+    ///
+    /// # Access Control
+    /// Admin-only.
+    ///
+    /// # Front-running Behavior
+    /// First valid release for a bounty transitions state to `Released`. Later release/refund/claim
+    /// races against that bounty must fail with `Error::FundsNotLocked`.
+    ///
+    /// # Security
+    /// Reentrancy guard is always cleared before any explicit error return after acquisition.
     pub fn release_funds(env: Env, bounty_id: u64, contributor: Address) -> Result<(), Error> {
         // Validation precedence (deterministic ordering):
         // 1. Reentrancy guard
@@ -2243,6 +2267,7 @@ impl BountyEscrowContract {
             .unwrap();
 
         if escrow.status != EscrowStatus::Locked {
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::FundsNotLocked);
         }
 
@@ -2265,6 +2290,7 @@ impl BountyEscrowContract {
             .checked_sub(release_fee)
             .unwrap_or(escrow.amount);
         if net_payout <= 0 {
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::InvalidAmount);
         }
 
@@ -2398,7 +2424,14 @@ impl BountyEscrowContract {
         Ok(())
     }
 
-    /// Admin can authorize a release as a pending claim instead of immediate transfer.
+    /// Authorizes a pending claim instead of immediate transfer.
+    ///
+    /// # Access Control
+    /// Admin-only.
+    ///
+    /// # Front-running Behavior
+    /// Repeated authorizations are overwrite semantics: the latest successful authorization for
+    /// a locked bounty replaces the previous pending recipient/record.
     pub fn authorize_claim(
         env: Env,
         bounty_id: u64,
@@ -2459,7 +2492,13 @@ impl BountyEscrowContract {
         Ok(())
     }
 
-    /// Beneficiary calls this to claim their authorized funds within the window.
+    /// Claims an existing pending authorization.
+    ///
+    /// # Access Control
+    /// Only the authorized pending `recipient` can claim.
+    ///
+    /// # Front-running Behavior
+    /// Claim is single-use: once marked claimed and escrow is released, subsequent calls fail.
     pub fn claim(env: Env, bounty_id: u64) -> Result<(), Error> {
         if Self::check_paused(&env, symbol_short!("release")) {
             return Err(Error::FundsPaused);
@@ -2705,8 +2744,14 @@ impl BountyEscrowContract {
         Ok(())
     }
 
-    /// Release a partial amount of the locked funds to the contributor.
-    /// Only the admin (backend) can authorize this.
+    /// Releases a partial amount of locked funds.
+    ///
+    /// # Access Control
+    /// Admin-only.
+    ///
+    /// # Front-running Behavior
+    /// Each successful call decreases `remaining_amount` exactly once. Attempts to exceed remaining
+    /// balance fail with `Error::InsufficientFunds`.
     ///
     /// - `payout_amount` must be > 0 and <= `remaining_amount`.
     /// - `remaining_amount` is decremented by `payout_amount` after each call.
@@ -2769,49 +2814,6 @@ impl BountyEscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(bounty_id), &escrow);
-        let mut escrow: Escrow = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow(bounty_id))
-            .unwrap();
-
-        if escrow.status != EscrowStatus::Locked {
-            return Err(Error::FundsNotLocked);
-        }
-
-        // Guard: zero or negative payout makes no sense and would corrupt state
-        if payout_amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        // Guard: prevent overpayment — payout cannot exceed what is still owed
-        if payout_amount > escrow.remaining_amount {
-            return Err(Error::InsufficientFunds);
-        }
-
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let client = token::Client::new(&env, &token_addr);
-
-        // Transfer only the requested partial amount to the contributor
-        client.transfer(
-            &env.current_contract_address(),
-            &contributor,
-            &payout_amount,
-        );
-
-        // Decrement remaining; this is always an exact integer subtraction — no rounding
-        escrow.remaining_amount -= payout_amount;
-
-        // Automatically transition to Released once fully paid out
-        if escrow.remaining_amount == 0 {
-            escrow.status = EscrowStatus::Released;
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Escrow(bounty_id), &escrow);
-
-        let timestamp = env.ledger().timestamp();
         events::emit_funds_released(
             &env,
             FundsReleased {
@@ -2826,8 +2828,14 @@ impl BountyEscrowContract {
         Ok(())
     }
 
-    /// Refund funds to the original depositor if the deadline has passed.
-    /// Refunds the full remaining_amount (accounts for any prior partial releases).
+    /// Refunds funds to the depositor (or approved recipient).
+    ///
+    /// # Front-running Behavior
+    /// If refund executes first and transitions escrow out of `Locked`, subsequent release/claim
+    /// races fail with `Error::FundsNotLocked`.
+    ///
+    /// # Security
+    /// Pending unclaimed `authorize_claim` records block refund (`Error::ClaimPending`).
     pub fn refund(env: Env, bounty_id: u64) -> Result<(), Error> {
         if Self::check_paused(&env, symbol_short!("refund")) {
             return Err(Error::FundsPaused);
@@ -3711,6 +3719,8 @@ impl BountyEscrowContract {
     /// # Ordering Guarantee
     /// Items are processed in ascending `bounty_id` order, regardless of caller
     /// input ordering.
+    ///
+    /// This ordering ensures deterministic event/state sequencing for identical item sets.
     ///
     /// # Note
     /// This operation is atomic - if any item fails, the entire transaction
