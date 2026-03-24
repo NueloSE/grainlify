@@ -359,6 +359,73 @@ pub struct ProgramData {
     pub reference_hash: Option<soroban_sdk::Bytes>,
 }
 
+// ========================================================================
+// Dispute Resolution Types
+// ========================================================================
+
+/// The lifecycle state of a dispute on a program.
+///
+/// Transitions:
+/// ```text
+/// (none) ──open_dispute()──► Open ──resolve_dispute()──► Resolved
+/// ```
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisputeState {
+    /// No active dispute; payouts proceed normally.
+    None,
+    /// Dispute is open; all payouts are blocked.
+    Open,
+    /// Dispute has been resolved; payouts are unblocked.
+    Resolved,
+}
+
+/// On-chain record of a dispute raised against a program.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    /// Address that raised the dispute (must be admin).
+    pub raised_by: Address,
+    /// Human-readable reason for the dispute.
+    pub reason: String,
+    /// Ledger timestamp when the dispute was opened.
+    pub opened_at: u64,
+    /// Current lifecycle state.
+    pub state: DisputeState,
+    /// Address that resolved the dispute, if any.
+    pub resolved_by: Option<Address>,
+    /// Ledger timestamp when the dispute was resolved, if any.
+    pub resolved_at: Option<u64>,
+    /// Resolution notes provided by the resolver.
+    pub resolution_notes: Option<String>,
+}
+
+/// Event emitted when a dispute is opened.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeOpenedEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub raised_by: Address,
+    pub reason: String,
+    pub opened_at: u64,
+}
+
+/// Event emitted when a dispute is resolved.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeResolvedEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub resolved_by: Address,
+    pub resolution_notes: String,
+    pub resolved_at: u64,
+}
+
+// Event symbols for dispute lifecycle
+const DISPUTE_OPENED: Symbol = symbol_short!("DspOpen");
+const DISPUTE_RESOLVED: Symbol = symbol_short!("DspRslv");
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -376,6 +443,7 @@ pub enum DataKey {
     MaintenanceMode,                 // bool flag
     ProgramDependencies(String),     // program_id -> Vec<String>
     DependencyStatus(String),        // program_id -> DependencyStatus
+    Dispute,                         // DisputeRecord (single active dispute per contract)
 }
 
 #[contracttype]
@@ -1454,6 +1522,12 @@ impl ProgramEscrowContract {
             panic!("Funds Paused");
         }
 
+        // 3b. Dispute guard — payouts blocked while a dispute is open
+        if Self::dispute_state(&env) == DisputeState::Open {
+            reentrancy_guard::clear_entered(&env);
+            panic!("Payout blocked: dispute open");
+        }
+
         // 4. Authorization
         program_data.authorized_payout_key.require_auth();
 
@@ -1570,6 +1644,12 @@ impl ProgramEscrowContract {
         if Self::check_paused(&env, symbol_short!("release")) {
             reentrancy_guard::clear_entered(&env);
             panic!("Funds Paused");
+        }
+
+        // 3b. Dispute guard — payouts blocked while a dispute is open
+        if Self::dispute_state(&env) == DisputeState::Open {
+            reentrancy_guard::clear_entered(&env);
+            panic!("Payout blocked: dispute open");
         }
 
         // 4. Authorization
@@ -2348,6 +2428,138 @@ impl ProgramEscrowContract {
 
     pub fn get_claim_window(env: Env) -> u64 {
         claim_period::get_claim_window(&env)
+    }
+
+    // ========================================================================
+    // Dispute Resolution
+    // ========================================================================
+
+    /// Returns the current dispute state for this contract instance.
+    ///
+    /// `DisputeState::None` is returned when no dispute record exists.
+    fn dispute_state(env: &Env) -> DisputeState {
+        env.storage()
+            .instance()
+            .get::<DataKey, DisputeRecord>(&DataKey::Dispute)
+            .map(|r| r.state)
+            .unwrap_or(DisputeState::None)
+    }
+
+    /// Open a dispute on the program, blocking all payouts until resolved.
+    ///
+    /// # Authorization
+    /// Caller must be the contract admin.
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Contract is not initialized (no admin set).
+    /// - A dispute is already open (`DisputeState::Open`).
+    ///
+    /// # Events
+    /// Emits `DspOpen` with [`DisputeOpenedEvent`].
+    pub fn open_dispute(env: Env, reason: String) -> DisputeRecord {
+        let admin = Self::require_admin(&env);
+
+        // Only one active dispute at a time
+        if Self::dispute_state(&env) == DisputeState::Open {
+            panic!("Dispute already open");
+        }
+
+        let now = env.ledger().timestamp();
+        let program_data: ProgramData = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_DATA)
+            .unwrap_or_else(|| panic!("Program not initialized"));
+
+        let record = DisputeRecord {
+            raised_by: admin.clone(),
+            reason: reason.clone(),
+            opened_at: now,
+            state: DisputeState::Open,
+            resolved_by: None,
+            resolved_at: None,
+            resolution_notes: None,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Dispute, &record);
+
+        env.events().publish(
+            (DISPUTE_OPENED,),
+            DisputeOpenedEvent {
+                version: EVENT_VERSION_V2,
+                program_id: program_data.program_id,
+                raised_by: admin,
+                reason,
+                opened_at: now,
+            },
+        );
+
+        record
+    }
+
+    /// Resolve an open dispute, unblocking payouts.
+    ///
+    /// # Authorization
+    /// Caller must be the contract admin.
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Contract is not initialized (no admin set).
+    /// - No dispute is currently open.
+    ///
+    /// # Events
+    /// Emits `DspRslv` with [`DisputeResolvedEvent`].
+    pub fn resolve_dispute(env: Env, resolution_notes: String) -> DisputeRecord {
+        let admin = Self::require_admin(&env);
+
+        let mut record: DisputeRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute)
+            .unwrap_or_else(|| panic!("No dispute found"));
+
+        if record.state != DisputeState::Open {
+            panic!("No open dispute to resolve");
+        }
+
+        let now = env.ledger().timestamp();
+        let program_data: ProgramData = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_DATA)
+            .unwrap_or_else(|| panic!("Program not initialized"));
+
+        record.state = DisputeState::Resolved;
+        record.resolved_by = Some(admin.clone());
+        record.resolved_at = Some(now);
+        record.resolution_notes = Some(resolution_notes.clone());
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Dispute, &record);
+
+        env.events().publish(
+            (DISPUTE_RESOLVED,),
+            DisputeResolvedEvent {
+                version: EVENT_VERSION_V2,
+                program_id: program_data.program_id,
+                resolved_by: admin,
+                resolution_notes,
+                resolved_at: now,
+            },
+        );
+
+        record
+    }
+
+    /// Return the current dispute record, if any.
+    ///
+    /// Returns `None` when no dispute has ever been opened.
+    pub fn get_dispute(env: Env) -> Option<DisputeRecord> {
+        env.storage().instance().get(&DataKey::Dispute)
     }
 }
 
