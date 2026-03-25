@@ -50,7 +50,7 @@
 //! | Amount > remaining balance | Panics with `insufficient escrow balance` |
 
 use crate::{DataKey, PayoutRecord, ProgramData, PROGRAM_DATA};
-use soroban_sdk::{contracttype, symbol_short, token, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, token, Address, Env, String, Vec};
 
 // ---------------------------------------------------------------------------
 // Constants
