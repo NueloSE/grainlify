@@ -192,6 +192,7 @@ fn serialization_compatibility_public_types_and_events() {
             ClaimRecord {
                 bounty_id,
                 recipient: recipient.clone(),
+                reason: crate::DisputeReason::Other,
                 amount: 1234,
                 expires_at: 555,
                 claimed: false,
@@ -387,15 +388,14 @@ fn serialization_compatibility_public_types_and_events() {
             EmergencyWithdrawEvent {
                 admin: admin.clone(),
                 recipient: depositor.clone(),
-                amount: 1000,
-                timestamp: 500,
+                amount: 1000, timestamp: 500,
             }
             .into_val(&env),
         ),
         (
             "CapabilityIssued",
             CapabilityIssued {
-                capability_id: 7,
+                capability_id: BytesN::from_array(&env, &[7u8; 32]),
                 owner: admin.clone(),
                 holder: holder.clone(),
                 action: CapabilityAction::Refund,
@@ -410,7 +410,7 @@ fn serialization_compatibility_public_types_and_events() {
         (
             "CapabilityUsed",
             CapabilityUsed {
-                capability_id: 7,
+                capability_id: BytesN::from_array(&env, &[7u8; 32]),
                 holder: holder.clone(),
                 action: CapabilityAction::Refund,
                 bounty_id,
@@ -424,7 +424,7 @@ fn serialization_compatibility_public_types_and_events() {
         (
             "CapabilityRevoked",
             CapabilityRevoked {
-                capability_id: 7,
+                capability_id: BytesN::from_array(&env, &[7u8; 32]),
                 owner: admin.clone(),
                 revoked_at: 111,
             }

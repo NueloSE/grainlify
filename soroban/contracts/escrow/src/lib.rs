@@ -3,7 +3,7 @@
 //! Parity with main contracts/bounty_escrow where applicable; see soroban/PARITY.md.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String, Vec,
 };
 
 mod identity;
@@ -11,29 +11,30 @@ pub use identity::*;
 
 mod reentrancy_guard;
 
+use grainlify_core::errors;
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
 #[repr(u32)]
 pub enum Error {
-    NotInitialized = 1,
-    AlreadyInitialized = 2,
-    BountyExists = 3,
-    BountyNotFound = 4,
-    FundsNotLocked = 5,
+    NotInitialized = 2,
+    AlreadyInitialized = 1,
+    BountyExists = 201,
+    BountyNotFound = 202,
+    FundsNotLocked = 203,
     DeadlineNotPassed = 6,
-    Unauthorized = 7,
-    InsufficientBalance = 8,
-    InvalidLabel = 9,
-    TooManyLabels = 10,
-    LabelNotAllowed = 11,
+    Unauthorized = 3,
+    InsufficientFunds = 5,
+    InvalidLabel = 226,
+    TooManyLabels = 227,
+    LabelNotAllowed = 228,
     // Identity-related errors
-    InvalidSignature = 100,
-    ClaimExpired = 101,
-    UnauthorizedIssuer = 102,
-    InvalidClaimFormat = 103,
-    TransactionExceedsLimit = 104,
-    InvalidRiskScore = 105,
-    InvalidTier = 106,
+    InvalidSignature = 301,
+    ClaimExpired = 302,
+    UnauthorizedIssuer = 303,
+    InvalidClaimFormat = 304,
+    TransactionExceedsLimit = 305,
+    InvalidRiskScore = 306,
+    InvalidTier = 307,
 }
 
 #[contracttype]
@@ -53,6 +54,7 @@ pub struct Escrow {
     pub status: EscrowStatus,
     pub deadline: u64,
     pub jurisdiction: OptionalJurisdiction,
+    pub labels: Vec<String>,
 }
 
 #[contracttype]
@@ -473,34 +475,45 @@ impl EscrowContract {
 
         depositor.require_auth();
         if !env.storage().instance().has(&DataKey::Admin) {
+            reentrancy_guard::release(&env);
             return Err(Error::NotInitialized);
         }
         if amount <= 0 {
-            return Err(Error::InsufficientBalance);
+            return Err(Error::InsufficientFunds);
         }
         if env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
+            reentrancy_guard::release(&env);
             return Err(Error::BountyExists);
         }
 
         // Enforcement rules from JURISDICTION_SEGMENTATION.md
         if let OptionalJurisdiction::Some(config) = &jurisdiction {
             if config.lock_paused {
-                return Err(Error::Unauthorized); // Should be a better error, but matching tests
+                reentrancy_guard::release(&env);
+                return Err(Error::Unauthorized);
             }
             if let Some(max_amount) = config.max_lock_amount {
                 if amount > max_amount {
+                    reentrancy_guard::release(&env);
                     return Err(Error::TransactionExceedsLimit);
                 }
             }
             if config.requires_kyc && !Self::is_claim_valid(env.clone(), depositor.clone()) {
+                reentrancy_guard::release(&env);
                 return Err(Error::Unauthorized);
             }
             if config.enforce_identity_limits {
-                Self::enforce_transaction_limit(&env, &depositor, amount)?;
+                if let Err(e) = Self::enforce_transaction_limit(&env, &depositor, amount) {
+                    reentrancy_guard::release(&env);
+                    return Err(e);
+                }
             }
         } else {
             // Generic behavior: always enforce identity limits
-            Self::enforce_transaction_limit(&env, &depositor, amount)?;
+            if let Err(e) = Self::enforce_transaction_limit(&env, &depositor, amount) {
+                reentrancy_guard::release(&env);
+                return Err(e);
+            }
         }
 
         // EFFECTS: write escrow state before external call
@@ -511,6 +524,7 @@ impl EscrowContract {
             status: EscrowStatus::Locked,
             deadline,
             jurisdiction: jurisdiction.clone(),
+            labels: Vec::new(&env),
         };
         env.storage()
             .persistent()
@@ -547,17 +561,6 @@ impl EscrowContract {
         let contract = env.current_contract_address();
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&depositor, &contract, &amount);
-
-        env.events().publish(
-            (ESCROW_LABELS_UPDATED, bounty_id),
-            EscrowLabelsUpdatedEvent {
-                version: 1,
-                bounty_id,
-                actor: depositor,
-                labels,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
 
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
@@ -597,7 +600,7 @@ impl EscrowContract {
             return Err(Error::FundsNotLocked);
         }
         if escrow.remaining_amount <= 0 {
-            return Err(Error::InsufficientBalance);
+            return Err(Error::InsufficientFunds);
         }
 
         // Enforce transaction limit for contributor
@@ -652,7 +655,7 @@ impl EscrowContract {
             return Err(Error::DeadlineNotPassed);
         }
         if escrow.remaining_amount <= 0 {
-            return Err(Error::InsufficientBalance);
+            return Err(Error::InsufficientFunds);
         }
 
         // EFFECTS: update state before external call (CEI)
@@ -925,3 +928,4 @@ pub mod traits {
 
 mod identity_test;
 mod test;
+mod test_dispute_resolution;

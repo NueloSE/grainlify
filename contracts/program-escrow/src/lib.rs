@@ -649,6 +649,8 @@ pub struct ProgramAggregateStats {
     pub released_count: u32,
 }
 
+use grainlify_core::errors;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockItem {
@@ -678,21 +680,20 @@ pub struct BatchFundsReleased {
     pub total_amount: i128,
     pub timestamp: u64,
 }
-
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum BatchError {
-    InvalidBatchSize = 1,
-    ProgramAlreadyExists = 2,
-    DuplicateProgramId = 3,
-    ProgramNotFound = 4,
-    InvalidAmount = 5,
-    ScheduleNotFound = 6,
-    AlreadyReleased = 7,
-    Unauthorized = 8,
-    FundsPaused = 9,
-    DuplicateScheduleId = 10,
+    InvalidBatchSizeProgram = 403,
+    ProgramAlreadyExists = 401,
+    DuplicateProgramId = 402,
+    ProgramNotFound = 404,
+    InvalidAmount = 4,
+    ScheduleNotFound = 405,
+    AlreadyReleased = 406,
+    Unauthorized = 3,
+    FundsPaused = 407,
+    DuplicateScheduleId = 408,
 }
 
 pub const MAX_BATCH_SIZE: u32 = 100;
@@ -1135,7 +1136,7 @@ impl ProgramEscrowContract {
     ) -> Result<u32, BatchError> {
         let batch_size = items.len() as u32;
         if batch_size == 0 || batch_size > MAX_BATCH_SIZE {
-            return Err(BatchError::InvalidBatchSize);
+            return Err(BatchError::InvalidBatchSizeProgram);
         }
         for i in 0..batch_size {
             for j in (i + 1)..batch_size {
@@ -1165,7 +1166,7 @@ impl ProgramEscrowContract {
             let token_address = item.token_address.clone();
 
             if program_id.is_empty() {
-                return Err(BatchError::InvalidBatchSize);
+                return Err(BatchError::InvalidBatchSizeProgram);
             }
 
             let program_data = ProgramData {
@@ -3268,6 +3269,115 @@ impl ProgramEscrowContract {
     /// Returns `None` when no dispute has ever been opened.
     pub fn get_dispute(env: Env) -> Option<DisputeRecord> {
         env.storage().instance().get(&DataKey::Dispute)
+    }
+
+    /// Get reputation metrics for the current program.
+    /// Computes reputation based on schedules, payouts, and funds.
+    /// Returns zero overall_score_bps if any releases are overdue (penalty for missed milestones).
+    pub fn get_program_reputation(env: Env) -> ProgramReputation {
+        let program_data: Option<ProgramData> = env.storage().instance().get(&PROGRAM_DATA);
+
+        if program_data.is_none() {
+            // Return zero reputation for uninitialized program
+            return ProgramReputation {
+                total_payouts: 0,
+                total_scheduled: 0,
+                completed_releases: 0,
+                pending_releases: 0,
+                overdue_releases: 0,
+                dispute_count: 0,
+                refund_count: 0,
+                total_funds_locked: 0,
+                total_funds_distributed: 0,
+                completion_rate_bps: 10_000,
+                payout_fulfillment_rate_bps: 10_000,
+                overall_score_bps: 10_000,
+            };
+        }
+
+        let program_data = program_data.unwrap();
+        let schedules: Vec<ProgramReleaseSchedule> = env
+            .storage()
+            .instance()
+            .get(&SCHEDULES)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+
+        // Count schedule states
+        let mut total_scheduled: u32 = 0;
+        let mut completed_releases: u32 = 0;
+        let mut pending_releases: u32 = 0;
+        let mut overdue_releases: u32 = 0;
+
+        for schedule in schedules.iter() {
+            total_scheduled = total_scheduled.saturating_add(1);
+            if schedule.released {
+                completed_releases = completed_releases.saturating_add(1);
+            } else {
+                // Not yet released
+                pending_releases = pending_releases.saturating_add(1);
+                // Check if also overdue (past deadline but not released)
+                if schedule.release_timestamp <= now {
+                    overdue_releases = overdue_releases.saturating_add(1);
+                }
+            }
+        }
+
+        // Compute distributed funds from payout history
+        let mut total_funds_distributed: i128 = 0;
+        for payout in program_data.payout_history.iter() {
+            total_funds_distributed = total_funds_distributed.saturating_add(payout.amount);
+        }
+
+        let total_payouts = program_data.payout_history.len() as u32;
+        let total_funds_locked = program_data.total_funds;
+
+        // Compute completion_rate_bps
+        let completion_rate_bps = if total_scheduled == 0 {
+            10_000 // Default to perfect if no schedules
+        } else {
+            let rate = (completed_releases as u64)
+                .saturating_mul(10_000)
+                .saturating_div(total_scheduled as u64);
+            (rate.min(10_000)) as u32
+        };
+
+        // Compute payout_fulfillment_rate_bps
+        let payout_fulfillment_rate_bps = if total_funds_locked == 0 {
+            10_000 // Default to perfect if no funds locked
+        } else {
+            let rate = total_funds_distributed
+                .saturating_mul(10_000)
+                .saturating_div(total_funds_locked);
+            (rate.min(10_000)) as u32
+        };
+
+        // Compute overall_score_bps: 0 if overdue releases exist, else weighted average
+        let overall_score_bps = if overdue_releases > 0 {
+            0 // Reputation penalty: any overdue release results in zero overall score
+        } else {
+            let weighted = (completion_rate_bps as u64)
+                .saturating_mul(60)
+                .saturating_add((payout_fulfillment_rate_bps as u64).saturating_mul(40))
+                .saturating_div(100);
+            (weighted.min(10_000)) as u32
+        };
+
+        ProgramReputation {
+            total_payouts,
+            total_scheduled,
+            completed_releases,
+            pending_releases,
+            overdue_releases,
+            dispute_count: 0,
+            refund_count: 0,
+            total_funds_locked,
+            total_funds_distributed,
+            completion_rate_bps,
+            payout_fulfillment_rate_bps,
+            overall_score_bps,
+        }
     }
 }
 
