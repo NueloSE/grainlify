@@ -1177,4 +1177,6 @@ mod test;
 #[cfg(test)]
 mod test_search;
 #[cfg(test)]
+mod test_full_lifecycle;
+#[cfg(test)]
 mod test_max_counts;
