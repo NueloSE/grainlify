@@ -83,6 +83,10 @@ fn serialization_compatibility_public_types_and_events() {
         payout_history: payout_history.clone(),
         token_address: token.clone(),
         initial_liquidity: 500,
+        risk_flags: 0,
+        reference_hash: None,
+        archived: false,
+        archived_at: None,
     };
 
     let program_initialized = ProgramInitializedEvent {
@@ -187,6 +191,9 @@ fn serialization_compatibility_public_types_and_events() {
                 operation: Symbol::new(&env, "lock"),
                 paused: true,
                 admin: admin.clone(),
+                reason: None,
+                timestamp: 12345,
+                receipt_id: 1,
             }
             .into_val(&env),
         ),
@@ -256,6 +263,7 @@ fn serialization_compatibility_public_types_and_events() {
                 program_id: program_id.clone(),
                 authorized_payout_key: authorized.clone(),
                 token_address: token.clone(),
+                reference_hash: None,
             }
             .into_val(&env),
         ),
@@ -265,16 +273,6 @@ fn serialization_compatibility_public_types_and_events() {
                 threshold_amount: 1000,
                 signers: soroban_sdk::vec![&env, admin.clone(), authorized.clone()],
                 required_signatures: 2,
-            }
-            .into_val(&env),
-        ),
-        (
-            "PayoutApproval",
-            PayoutApproval {
-                program_id: program_id.clone(),
-                recipient: recipient.clone(),
-                amount: 123,
-                approvals: soroban_sdk::vec![&env, admin.clone()],
             }
             .into_val(&env),
         ),

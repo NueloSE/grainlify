@@ -1355,3 +1355,241 @@ fn test_drained_reactivate_triggers_pending_schedule() {
     assert_eq!(token_client.balance(&schedule_recipient), 30_000);
     assert_eq!(client.get_remaining_balance(), 20_000);
 }
+
+// ---------------------------------------------------------------------------
+// NEW: Event Verification & ID Management
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schedule_id_incrementing() {
+    let env = Env::default();
+    let (client, _admin, _cid, _token) = setup_active_program(&env, 100_000);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    client.create_program_release_schedule(&r1, &10_000, &100);
+    client.create_program_release_schedule(&r2, &10_000, &200);
+
+    let schedules = client.get_release_schedules();
+    assert_eq!(schedules.len(), 2);
+    assert_eq!(schedules.get(0).unwrap().schedule_id, 1);
+    assert_eq!(schedules.get(1).unwrap().schedule_id, 2);
+}
+
+#[test]
+fn test_manual_release_disregards_timestamp() {
+    let env = Env::default();
+    let (client, _admin, _cid, token_client) = setup_active_program(&env, 100_000);
+    let r = Address::generate(&env);
+
+    let now = env.ledger().timestamp();
+    // Schedule for 1 hour in the future
+    let schedule = client.create_program_release_schedule(&r, &10_000, &(now + 3600));
+
+    // Manual release should work immediately
+    client.release_program_schedule_manual(&schedule.schedule_id);
+    assert_eq!(token_client.balance(&r), 10_000);
+}
+
+#[test]
+#[should_panic(expected = "Not yet due")]
+fn test_automatic_release_enforces_timestamp() {
+    let env = Env::default();
+    let (client, _admin, _cid, _token) = setup_active_program(&env, 100_000);
+    let r = Address::generate(&env);
+
+    let now = env.ledger().timestamp();
+    let schedule = client.create_program_release_schedule(&r, &10_000, &(now + 3600));
+
+    // Automatic release should fail if now < release_timestamp
+    client.release_prog_schedule_automatic(&schedule.schedule_id);
+}
+
+#[test]
+#[should_panic(expected = "Insufficient balance")]
+fn test_no_double_spend_batch_then_schedule() {
+    let env = Env::default();
+    let (client, _admin, _cid, _token) = setup_active_program(&env, 40_000);
+    let r = Address::generate(&env);
+
+    client.create_program_release_schedule(&r, &30_000, &0);
+    // Spend most of the balance
+    client.batch_payout(&vec![&env, r.clone()], &vec![&env, 20_000i128]);
+
+    // Only 20k left, 30k schedule should fail
+    client.trigger_program_releases();
+}
+
+#[test]
+#[should_panic(expected = "Insufficient balance")]
+fn test_no_double_spend_schedule_then_batch() {
+    let env = Env::default();
+    let (client, _admin, _cid, _token) = setup_active_program(&env, 40_000);
+    let r = Address::generate(&env);
+
+    client.create_program_release_schedule(&r, &30_000, &0);
+    client.trigger_program_releases(); // 10k left
+
+    // Attempting 20k payout should fail
+    client.batch_payout(&vec![&env, r], &vec![&env, 20_000i128]);
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Fee Integration Tests for lock_program_funds
+// ---------------------------------------------------------------------------
+
+/// Locking funds without fees enabled deducts nothing.
+#[test]
+fn test_lock_program_funds_fees_disabled() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (_, token_id) = fund_contract(&env, &contract_id, 100_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "hack-2026");
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+
+    // Lock with no fees set
+    let data = client.lock_program_funds(&100_000);
+    assert_eq!(data.remaining_balance, 100_000);
+    assert_eq!(data.total_funds, 100_000);
+}
+
+/// Locking funds with fees enabled deducts fee from remaining balance.
+#[test]
+fn test_lock_program_funds_with_fees_enabled() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (token_client, token_id) = fund_contract(&env, &contract_id, 200_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "hack-2026");
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+
+    // Enable fees: 2% lock fee (200 basis points)
+    client.set_lock_fee_rate(&200);
+    client.set_fees_enabled(&true);
+
+    // Lock 100_000: 2% fee = 2_000, net = 98_000
+    let data = client.lock_program_funds(&100_000);
+    assert_eq!(data.remaining_balance, 98_000);
+    assert_eq!(data.total_funds, 100_000); // Total includes gross, not net
+
+    // Fee recipient should have received 2_000
+    assert_eq!(token_client.balance(&admin), 2_000);
+}
+
+/// Multiple locks with fees accumulate correctly.
+#[test]
+fn test_lock_program_funds_multiple_locks_with_fees() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (token_client, token_id) = fund_contract(&env, &contract_id, 500_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "hack-2026");
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+
+    // Enable 1% lock fee (100 basis points)
+    client.set_lock_fee_rate(&100);
+    client.set_fees_enabled(&true);
+
+    // First lock: 100_000, fee = 1_000, net = 99_000
+    client.lock_program_funds(&100_000);
+
+    // Second lock: 50_000, fee = 500, net = 49_500
+    let data = client.lock_program_funds(&50_000);
+
+    assert_eq!(data.total_funds, 150_000);
+    assert_eq!(data.remaining_balance, 148_500); // 99_000 + 49_500
+    assert_eq!(token_client.balance(&admin), 1_500); // 1_000 + 500
+}
+
+/// Fee calculation with floor rounding (e.g., odd numbers).
+#[test]
+fn test_lock_program_funds_fee_floor_rounding() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (token_client, token_id) = fund_contract(&env, &contract_id, 200_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "hack-2026");
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+
+    // Enable 3% fee (300 basis points)
+    client.set_lock_fee_rate(&300);
+    client.set_fees_enabled(&true);
+
+    // Lock 10_001: fee = floor(10_001 * 300 / 10_000) = floor(300.03) = 300
+    // Net = 10_001 - 300 = 9_701
+    let data = client.lock_program_funds(&10_001);
+    assert_eq!(data.remaining_balance, 9_701);
+    assert_eq!(data.total_funds, 10_001);
+    assert_eq!(token_client.balance(&admin), 300);
+}
+
+/// Fee with zero lock_fee_rate should not charge fee.
+#[test]
+fn test_lock_program_funds_zero_fee_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (_, token_id) = fund_contract(&env, &contract_id, 100_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "hack-2026");
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+
+    // Enable fees but set lock_fee_rate to 0
+    client.set_lock_fee_rate(&0);
+    client.set_fees_enabled(&true);
+
+    let data = client.lock_program_funds(&100_000);
+    assert_eq!(data.remaining_balance, 100_000);
+    assert_eq!(data.total_funds, 100_000);
+}
+
+/// Overflow safety: locked amount much close to i128::MAX doesn't panic.
+#[test]
+fn test_lock_program_funds_overflow_safety() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let safe_val = (i128::MAX / 2) as i128;
+    let (client, contract_id) = make_client(&env);
+    let (_, token_id) = fund_contract(&env, &contract_id, safe_val);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "hack-2026");
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+
+    // No fees
+    client.set_fees_enabled(&false);
+
+    // Lock large amount
+    let data = client.lock_program_funds(&safe_val);
+    assert_eq!(data.total_funds, safe_val);
+    assert_eq!(data.remaining_balance, safe_val);
+}
+
+/// Fee recipient is correctly used even if not admin.
+#[test]
+fn test_lock_program_funds_fee_recipient_different_from_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (token_client, token_id) = fund_contract(&env, &contract_id, 200_000);
+    let admin = Address::generate(&env);
+    let fee_recipient = Address::generate(&env); // Different from admin
+    let program_id = String::from_str(&env, "hack-2026");
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+
+    // Set custom fee recipient
+    client.set_fee_recipient(&fee_recipient);
+    client.set_lock_fee_rate(&200); // 2%
+    client.set_fees_enabled(&true);
+
+    let data = client.lock_program_funds(&100_000);
+    assert_eq!(data.remaining_balance, 98_000);
+
+    // Fee recipient should receive the fee
+    assert_eq!(token_client.balance(&fee_recipient), 2_000);
+    assert_eq!(token_client.balance(&admin), 0); // Admin receives nothing
+}

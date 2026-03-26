@@ -34,8 +34,14 @@ macro_rules! setup_search {
 #[test]
 fn test_search_empty_contract() {
     setup_search!(
-        env, client, _contract_id, _admin, _program_admin,
-        _token_client, _token_admin, 0i128
+        env,
+        client,
+        _contract_id,
+        _admin,
+        _program_admin,
+        _token_client,
+        _token_admin,
+        0i128
     );
 
     let criteria = ProgramSearchCriteria {
@@ -54,8 +60,14 @@ fn test_search_empty_contract() {
 #[test]
 fn test_search_lists_all_programs() {
     setup_search!(
-        env, client, _contract_id, _admin, program_admin,
-        _token_client, _token_admin, 100_000i128
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        _token_admin,
+        100_000i128
     );
 
     for id in 1..=5u64 {
@@ -83,8 +95,14 @@ fn test_search_lists_all_programs() {
 #[test]
 fn test_search_pagination_basic() {
     setup_search!(
-        env, client, _contract_id, _admin, program_admin,
-        _token_client, _token_admin, 100_000i128
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        _token_admin,
+        100_000i128
     );
 
     for id in 1..=5u64 {
@@ -129,8 +147,14 @@ fn test_search_pagination_basic() {
 #[test]
 fn test_search_filter_by_status() {
     setup_search!(
-        env, client, _contract_id, _admin, program_admin,
-        _token_client, _token_admin, 100_000i128
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        _token_admin,
+        100_000i128
     );
 
     // Register 3 programs — all Active by default
@@ -160,13 +184,65 @@ fn test_search_filter_by_status() {
     assert_eq!(page.records.len(), 0);
 }
 
+#[test]
+fn test_search_filter_by_status_and_admin_together() {
+    setup_search!(
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        token_admin,
+        100_000i128
+    );
+
+    let other_admin = Address::generate(&env);
+    token_admin.mint(&other_admin, &100_000);
+
+    client.register_program(
+        &1,
+        &program_admin,
+        &String::from_str(&env, "Mine Active A"),
+        &1_000,
+    );
+    client.register_program(
+        &2,
+        &other_admin,
+        &String::from_str(&env, "Other Active"),
+        &1_000,
+    );
+    client.register_program(
+        &3,
+        &program_admin,
+        &String::from_str(&env, "Mine Active B"),
+        &1_000,
+    );
+
+    let criteria = ProgramSearchCriteria {
+        status_filter: 1,
+        admin: Some(program_admin.clone()),
+    };
+
+    let page = client.get_programs(&criteria, &None, &10);
+    assert_eq!(page.records.len(), 2);
+    assert_eq!(page.records.get(0).unwrap().program_id, 1);
+    assert_eq!(page.records.get(1).unwrap().program_id, 3);
+}
+
 // ==================== FILTER BY ADMIN ====================
 
 #[test]
 fn test_search_filter_by_admin() {
     setup_search!(
-        env, client, _contract_id, _admin, program_admin,
-        _token_client, token_admin, 100_000i128
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        token_admin,
+        100_000i128
     );
 
     let other_admin = Address::generate(&env);
@@ -217,8 +293,14 @@ fn test_search_filter_by_admin() {
 #[test]
 fn test_search_page_size_cap() {
     setup_search!(
-        env, client, _contract_id, _admin, program_admin,
-        _token_client, _token_admin, 1_000_000i128
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        _token_admin,
+        1_000_000i128
     );
 
     // Create 25 programs
@@ -243,13 +325,134 @@ fn test_search_page_size_cap() {
     assert!(page.next_cursor.is_some());
 }
 
+#[test]
+fn test_search_zero_limit_defaults_to_max_page_size() {
+    setup_search!(
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        _token_admin,
+        1_000_000i128
+    );
+
+    for id in 1..=25u64 {
+        client.register_program(
+            &id,
+            &program_admin,
+            &String::from_str(&env, "Program"),
+            &100,
+        );
+    }
+
+    let criteria = ProgramSearchCriteria {
+        status_filter: 0,
+        admin: None,
+    };
+
+    let page = client.get_programs(&criteria, &None, &0);
+    assert_eq!(page.records.len(), 20);
+    assert!(page.has_more);
+    assert_eq!(page.records.get(0).unwrap().program_id, 1);
+}
+
+#[test]
+fn test_search_unknown_cursor_returns_empty_page() {
+    setup_search!(
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        _token_admin,
+        100_000i128
+    );
+
+    for id in 1..=3u64 {
+        client.register_program(
+            &id,
+            &program_admin,
+            &String::from_str(&env, "Program"),
+            &1_000,
+        );
+    }
+
+    let criteria = ProgramSearchCriteria {
+        status_filter: 0,
+        admin: None,
+    };
+
+    let page = client.get_programs(&criteria, &Some(999), &10);
+    assert_eq!(page.records.len(), 0);
+    assert_eq!(page.next_cursor, None);
+    assert!(!page.has_more);
+}
+
+#[test]
+fn test_search_cursor_skips_non_matching_records() {
+    setup_search!(
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        token_admin,
+        100_000i128
+    );
+
+    let other_admin = Address::generate(&env);
+    token_admin.mint(&other_admin, &100_000);
+
+    client.register_program(&1, &other_admin, &String::from_str(&env, "Other A"), &1_000);
+    client.register_program(
+        &2,
+        &program_admin,
+        &String::from_str(&env, "Mine A"),
+        &1_000,
+    );
+    client.register_program(&3, &other_admin, &String::from_str(&env, "Other B"), &1_000);
+    client.register_program(
+        &4,
+        &program_admin,
+        &String::from_str(&env, "Mine B"),
+        &1_000,
+    );
+
+    let criteria = ProgramSearchCriteria {
+        status_filter: 0,
+        admin: Some(program_admin.clone()),
+    };
+
+    let first = client.get_programs(&criteria, &None, &1);
+    assert_eq!(first.records.len(), 1);
+    assert_eq!(first.records.get(0).unwrap().program_id, 2);
+    assert!(first.has_more);
+    assert_eq!(first.next_cursor, Some(2));
+
+    let second = client.get_programs(&criteria, &first.next_cursor, &1);
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(second.records.get(0).unwrap().program_id, 4);
+    assert!(!second.has_more);
+    assert_eq!(second.next_cursor, None);
+}
+
 // ==================== BATCH REGISTRATION INDEX TRACKING ====================
 
 #[test]
 fn test_search_batch_registered_programs() {
     setup_search!(
-        env, client, _contract_id, _admin, program_admin,
-        _token_client, _token_admin, 100_000i128
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        _token_admin,
+        100_000i128
     );
 
     let items = vec![
@@ -286,4 +489,172 @@ fn test_search_batch_registered_programs() {
     assert_eq!(page.records.get(1).unwrap().program_id, 20);
     assert_eq!(page.records.get(2).unwrap().program_id, 30);
     assert_eq!(client.get_program_count(), 3);
+}
+
+#[test]
+fn test_search_includes_jurisdiction_enabled_programs() {
+    setup_search!(
+        env,
+        client,
+        _contract_id,
+        _admin,
+        program_admin,
+        _token_client,
+        _token_admin,
+        100_000i128
+    );
+
+    let jurisdiction = ProgramJurisdictionConfig {
+        tag: Some(String::from_str(&env, "EU-only")),
+        requires_kyc: true,
+        max_funding: Some(10_000),
+        registration_paused: false,
+    };
+
+    client.register_program_juris(
+        &10,
+        &program_admin,
+        &String::from_str(&env, "Jurisdiction Program"),
+        &5_000,
+        &jurisdiction.tag.clone(),
+        &jurisdiction.requires_kyc,
+        &jurisdiction.max_funding.clone(),
+        &jurisdiction.registration_paused,
+        &OptionalJurisdiction::Some(jurisdiction.clone()),
+        &Some(true),
+    );
+
+    let criteria = ProgramSearchCriteria {
+        status_filter: 1,
+        admin: Some(program_admin.clone()),
+    };
+
+    let page = client.get_programs(&criteria, &None, &10);
+    assert_eq!(page.records.len(), 1);
+    let record = page.records.get(0).unwrap();
+    assert_eq!(record.program_id, 10);
+    assert_eq!(record.name, String::from_str(&env, "Jurisdiction Program"));
+    assert_eq!(client.get_program_jurisdiction(&10), Some(jurisdiction));
+}
+
+#[test]
+fn test_get_programs_by_label_filters_results() {
+    setup_search!(
+        env, client, _contract_id, _admin, program_admin,
+        _token_client, _token_admin, 100_000i128
+    );
+
+    let payroll = vec![
+        &env,
+        String::from_str(&env, "payroll"),
+        String::from_str(&env, "grant-2024"),
+    ];
+    let milestone = vec![
+        &env,
+        String::from_str(&env, "milestone-1"),
+    ];
+
+    client.register_program_with_labels(
+        &1,
+        &program_admin,
+        &String::from_str(&env, "Payroll A"),
+        &1_000,
+        &payroll,
+    );
+    client.register_program_with_labels(
+        &2,
+        &program_admin,
+        &String::from_str(&env, "Milestone B"),
+        &1_000,
+        &milestone,
+    );
+    client.register_program_with_labels(
+        &3,
+        &program_admin,
+        &String::from_str(&env, "Payroll C"),
+        &1_000,
+        &payroll,
+    );
+
+    let page = client.get_programs_by_label(&String::from_str(&env, "payroll"), &None, &10);
+    assert_eq!(page.records.len(), 2);
+    assert_eq!(page.records.get(0).unwrap().program_id, 1);
+    assert_eq!(page.records.get(1).unwrap().program_id, 3);
+}
+
+#[test]
+fn test_update_program_labels_by_program_admin() {
+    setup_search!(
+        env, client, _contract_id, contract_admin, program_admin,
+        _token_client, token_admin, 100_000i128
+    );
+
+    client.register_program(
+        &9,
+        &program_admin,
+        &String::from_str(&env, "Grant Program"),
+        &1_000,
+    );
+
+    let labels = vec![
+        &env,
+        String::from_str(&env, "grant-2024"),
+        String::from_str(&env, "milestone-1"),
+    ];
+    let updated = client.update_program_labels(&program_admin, &9, &labels);
+
+    assert_eq!(updated.labels.len(), 2);
+    assert_eq!(updated.labels.get(0).unwrap(), String::from_str(&env, "grant-2024"));
+    assert_eq!(client.get_program(&9).labels.len(), 2);
+
+    let admin_update = vec![&env, String::from_str(&env, "payroll")];
+    let updated_by_contract_admin = client.update_program_labels(&contract_admin, &9, &admin_update);
+    assert_eq!(updated_by_contract_admin.labels.len(), 1);
+    assert_eq!(updated_by_contract_admin.labels.get(0).unwrap(), String::from_str(&env, "payroll"));
+
+    let outsider = Address::generate(&env);
+    token_admin.mint(&outsider, &1_000);
+    let denied = client.try_update_program_labels(&outsider, &9, &admin_update);
+    assert!(denied.is_err());
+}
+
+#[test]
+fn test_restricted_label_config_is_enforced() {
+    setup_search!(
+        env, client, _contract_id, contract_admin, program_admin,
+        _token_client, _token_admin, 100_000i128
+    );
+
+    let allowed = vec![
+        &env,
+        String::from_str(&env, "payroll"),
+        String::from_str(&env, "grant-2024"),
+    ];
+    let config = client.set_label_config(&true, &allowed);
+    assert!(config.restricted);
+    assert_eq!(config.allowed_labels.len(), 2);
+
+    let allowed_labels = vec![&env, String::from_str(&env, "payroll")];
+    client.register_program_with_labels(
+        &20,
+        &program_admin,
+        &String::from_str(&env, "Allowed"),
+        &1_000,
+        &allowed_labels,
+    );
+
+    let blocked_labels = vec![&env, String::from_str(&env, "milestone-1")];
+    let blocked = client.try_register_program_with_labels(
+        &21,
+        &program_admin,
+        &String::from_str(&env, "Blocked"),
+        &1_000,
+        &blocked_labels,
+    );
+    assert!(blocked.is_err());
+
+    let fetched = client.get_label_config();
+    assert_eq!(fetched.allowed_labels.len(), 2);
+    assert_eq!(fetched.allowed_labels.get(0).unwrap(), String::from_str(&env, "payroll"));
+    assert_eq!(client.get_program(&20).labels.get(0).unwrap(), String::from_str(&env, "payroll"));
 }

@@ -49,7 +49,7 @@ fn test_upgrade_locked_bounty_remains_locked() {
     client.init(&admin, &token);
     token_admin_client.mint(&depositor, &10_000);
 
-    let deadline = env.ledger().timestamp() + 1_000;
+    let deadline = env.ledger().timestamp() + 1000;
     client.lock_funds(&depositor, &1, &5_000, &deadline);
 
     // Simulate upgrade by verifying state persistence (WASM swap keeps storage)
@@ -73,7 +73,7 @@ fn test_upgrade_complete_release_flow() {
     client.init(&admin, &token);
     token_admin_client.mint(&depositor, &10_000);
 
-    let deadline = env.ledger().timestamp() + 1_000;
+    let deadline = env.ledger().timestamp() + 1000;
     client.lock_funds(&depositor, &1, &5_000, &deadline);
 
     let escrow = client.get_escrow_info(&1);
@@ -125,7 +125,7 @@ fn test_upgrade_partial_release_then_complete() {
     client.init(&admin, &token);
     token_admin_client.mint(&depositor, &10_000);
 
-    let deadline = env.ledger().timestamp() + 1_000;
+    let deadline = env.ledger().timestamp() + 1000;
     client.lock_funds(&depositor, &3, &6_000, &deadline);
 
     client.partial_release(&3, &contributor, &2_000);

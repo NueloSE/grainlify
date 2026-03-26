@@ -1,68 +1,88 @@
-/// # Batch Lock and Batch Release Failure Mode Tests
-///
-/// These tests cover invalid batch sizes, duplicate IDs, mixed valid/invalid
-/// entries, and partial failure scenarios for `batch_lock_funds` and
-/// `batch_release_funds`.
-///
-/// Place this file at:
-///   contracts/bounty_escrow/contracts/escrow/src/test_batch_failure_modes.rs
-///
-/// Then add to lib.rs (inside `#[cfg(test)] mod test;` block or as its own module):
-///   mod test_batch_failure_modes;
+// ============================================================
+// FILE: contracts/bounty_escrow/contracts/escrow/src/test_batch_failure_modes.rs
+//
+// ## Batch failure semantics
+//
+// `batch_lock_funds` and `batch_release_funds` are **strictly atomic**:
+// all items pass validation before *any* state is mutated.  A single
+// invalid row causes the entire call to revert — no escrow record is
+// written, no token transfer is made, and every "sibling" row in the
+// same batch is left completely unaffected.
+//
+// This file exercises that guarantee from a second, independent angle:
+// it uses a functional-style setup helper instead of the `TestCtx` struct
+// found in `test_batch_failure_mode.rs`, providing complementary coverage
+// with a different test harness.
+//
+// ## Coverage (this file)
+//
+//   BATCH LOCK
+//     - Empty batch → InvalidBatchSize
+//     - Single-item batch (min boundary) → success
+//     - MAX_BATCH_SIZE items (max boundary = 20) → success
+//     - MAX_BATCH_SIZE + 1 items → InvalidBatchSize
+//     - Duplicate bounty_id within batch → DuplicateBountyId
+//     - Existing bounty_id in storage → BountyExists
+//     - Second item has zero amount → InvalidAmount, first not stored
+//     - Last item is a duplicate → DuplicateBountyId, earlier items not stored
+//     - Contract not initialised → NotInitialized
+//     - Zero-amount single-item batch → InvalidAmount
+//     - Same depositor in multiple items → success (auth deduplication)
+//
+//   BATCH RELEASE
+//     - Empty batch → InvalidBatchSize
+//     - Single-item batch (min boundary) → success
+//     - MAX_BATCH_SIZE items (max boundary = 20) → success
+//     - MAX_BATCH_SIZE + 1 items → InvalidBatchSize
+//     - Duplicate bounty_id within batch → DuplicateBountyId
+//     - Nonexistent bounty → BountyNotFound
+//     - Second item nonexistent, first valid → BountyNotFound, first stays Locked
+//     - Already-released bounty → FundsNotLocked
+//     - Mix of Locked and Refunded → FundsNotLocked, Locked sibling unaffected
+//     - Contract not initialised → NotInitialized
+//     - Partial failure atomicity over 3 bounties → none released
+// ============================================================
 
-#[cfg(test)]
-mod test_batch_failure_modes {
-    use soroban_sdk::{
-        testutils::{Address as _, Ledger, LedgerInfo},
-        token, vec, Address, Env, Vec,
-    };
+#![cfg(test)]
 
-    use crate::{
-        BountyEscrowContract, BountyEscrowContractClient, Error, LockFundsItem, ReleaseFundsItem,
-    };
+use soroban_sdk::{
+    testutils::{Address as _, Ledger, LedgerInfo},
+    token, vec, Address, Env, Vec,
+};
 
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
+use crate::{BountyEscrowContract, BountyEscrowContractClient, Error, LockFundsItem, ReleaseFundsItem};
 
-    /// Minimal test harness: returns (env, client, admin, token_admin, token_client).
-    fn setup() -> (
-        Env,
-        BountyEscrowContractClient<'static>,
-        Address,
-        Address,
-        Address,
-    ) {
-        let env = Env::default();
-        env.mock_all_auths();
+// ---------------------------------------------------------------------------
+// Constants — must match lib.rs
+// ---------------------------------------------------------------------------
 
-        let admin = Address::generate(&env);
-        let token_admin = Address::generate(&env);
+/// Maximum batch size enforced by the contract.
+const MAX_BATCH: u32 = 20;
+/// Default per-bounty lock amount.
+const AMOUNT: i128 = 500;
+/// Default deadline offset in seconds (1 hour ahead).
+const DEADLINE_OFFSET: u64 = 3_600;
 
-        // Deploy a SAC-compatible token
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
 
-        // Deploy the escrow contract
-        let contract_id = env.register_contract(None, BountyEscrowContract);
-        let client = BountyEscrowContractClient::new(&env, &contract_id);
+struct Ctx<'a> {
+    env: Env,
+    client: BountyEscrowContractClient<'a>,
+    token_id: Address,
+    token_admin: Address,
+}
 
-        client.init(&admin, &token_id);
+/// Create a fresh environment, register the escrow contract and a SAC token,
+/// and call `init`.
+fn setup() -> Ctx<'static> {
+    let env = Env::default();
+    env.mock_all_auths();
 
-        (env, client, admin, token_admin, token_id)
-    }
-
-    /// Mint `amount` tokens to `recipient` using the SAC token admin.
-    fn mint(
-        env: &Env,
-        token_id: &Address,
-        token_admin: &Address,
-        recipient: &Address,
-        amount: i128,
-    ) {
-        let token_client = token::StellarAssetClient::new(env, token_id);
-        token_client.mint(recipient, &amount);
-    }
-
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin.clone());
     /// Convenience: build a single `LockFundsItem`.
     fn lock_item(
         env: &Env,
@@ -76,580 +96,559 @@ mod test_batch_failure_modes {
             depositor,
             amount,
             deadline,
-            non_transferable_rewards: false,
         }
     }
 
-    /// Advance ledger timestamp by `seconds`.
-    fn advance_time(env: &Env, seconds: u64) {
-        env.ledger().set(LedgerInfo {
-            timestamp: env.ledger().timestamp() + seconds,
-            ..env.ledger().get()
+    let contract_id = env.register_contract(None, BountyEscrowContract);
+    let client = BountyEscrowContractClient::new(&env, &contract_id);
+    client.init(&admin, &token_id);
+
+    Ctx { env, client, token_id, token_admin }
+}
+
+/// Mint `amount` tokens to `recipient`.
+fn mint(ctx: &Ctx, recipient: &Address, amount: i128) {
+    token::StellarAssetClient::new(&ctx.env, &ctx.token_id).mint(recipient, &amount);
+}
+
+/// Build a [`LockFundsItem`] with default deadline.
+fn lock_item(ctx: &Ctx, bounty_id: u64, depositor: Address, amount: i128) -> LockFundsItem {
+    LockFundsItem {
+        bounty_id,
+        depositor,
+        amount,
+        deadline: ctx.env.ledger().timestamp() + DEADLINE_OFFSET,
+    }
+}
+
+/// Lock a single bounty via the single-item path (for pre-seeding state).
+fn lock_one(ctx: &Ctx, depositor: &Address, bounty_id: u64) {
+    ctx.client.lock_funds(
+        depositor,
+        &bounty_id,
+        &AMOUNT,
+        &(ctx.env.ledger().timestamp() + DEADLINE_OFFSET),
+    );
+}
+
+/// Advance the ledger timestamp by `seconds`.
+fn advance_time(ctx: &Ctx, seconds: u64) {
+    ctx.env.ledger().set(LedgerInfo {
+        timestamp: ctx.env.ledger().timestamp() + seconds,
+        ..ctx.env.ledger().get()
+    });
+}
+
+// ===========================================================================
+// BATCH LOCK FUNDS — failure modes
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Batch size boundaries
+// ---------------------------------------------------------------------------
+
+/// Empty batch must return `InvalidBatchSize`.
+#[test]
+fn batch_lock_empty_batch_fails() {
+    let ctx = setup();
+    let empty: Vec<LockFundsItem> = Vec::new(&ctx.env);
+    assert_eq!(
+        ctx.client.try_batch_lock_funds(&empty).unwrap_err().unwrap(),
+        Error::InvalidBatchSize
+    );
+}
+
+/// A single-item batch (minimum valid size) must succeed.
+#[test]
+fn batch_lock_single_item_succeeds() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT);
+    let items = vec![&ctx.env, lock_item(&ctx, 1, depositor, AMOUNT)];
+    assert_eq!(ctx.client.batch_lock_funds(&items), 1);
+}
+
+/// A batch of exactly `MAX_BATCH` items must succeed.
+#[test]
+fn batch_lock_exactly_max_batch_size_succeeds() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT * MAX_BATCH as i128);
+
+    let mut items: Vec<LockFundsItem> = Vec::new(&ctx.env);
+    for i in 1..=MAX_BATCH as u64 {
+        items.push_back(lock_item(&ctx, i, depositor.clone(), AMOUNT));
+    }
+    assert_eq!(ctx.client.batch_lock_funds(&items), MAX_BATCH);
+}
+
+/// A batch of `MAX_BATCH + 1` items must return `InvalidBatchSize`.
+#[test]
+fn batch_lock_exceeds_max_batch_size_fails() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT * (MAX_BATCH as i128 + 1));
+
+    let mut items: Vec<LockFundsItem> = Vec::new(&ctx.env);
+    for i in 1..=(MAX_BATCH + 1) as u64 {
+        items.push_back(lock_item(&ctx, i, depositor.clone(), AMOUNT));
+    }
+    assert_eq!(
+        ctx.client.try_batch_lock_funds(&items).unwrap_err().unwrap(),
+        Error::InvalidBatchSize
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate bounty_id
+// ---------------------------------------------------------------------------
+
+/// Two items sharing the same `bounty_id` → `DuplicateBountyId`.
+#[test]
+fn batch_lock_duplicate_bounty_id_within_batch_fails() {
+    let ctx = setup();
+    let dep1 = Address::generate(&ctx.env);
+    let dep2 = Address::generate(&ctx.env);
+    mint(&ctx, &dep1, AMOUNT);
+    mint(&ctx, &dep2, AMOUNT);
+
+    let items = vec![
+        &ctx.env,
+        lock_item(&ctx, 99, dep1, AMOUNT),
+        lock_item(&ctx, 99, dep2, AMOUNT), // duplicate
+    ];
+    assert_eq!(
+        ctx.client.try_batch_lock_funds(&items).unwrap_err().unwrap(),
+        Error::DuplicateBountyId
+    );
+}
+
+/// A bounty_id that already exists in persistent storage → `BountyExists`.
+#[test]
+fn batch_lock_bounty_id_already_in_storage_fails() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT * 2);
+
+    lock_one(&ctx, &depositor, 42);
+
+    let items = vec![&ctx.env, lock_item(&ctx, 42, depositor, AMOUNT)];
+    assert_eq!(
+        ctx.client.try_batch_lock_funds(&items).unwrap_err().unwrap(),
+        Error::BountyExists
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mixed valid / invalid — atomicity (sibling protection)
+// ---------------------------------------------------------------------------
+
+/// Second item has a zero amount; first valid sibling must NOT be stored.
+///
+/// Security note: this proves that a failing row cannot corrupt the state for
+/// any row that was validated before it in the same batch.
+#[test]
+fn batch_lock_invalid_second_item_rolls_back_first_sibling() {
+    let ctx = setup();
+    let dep1 = Address::generate(&ctx.env);
+    let dep2 = Address::generate(&ctx.env);
+    mint(&ctx, &dep1, AMOUNT);
+
+    let items = vec![
+        &ctx.env,
+        lock_item(&ctx, 1, dep1, AMOUNT), // valid
+        lock_item(&ctx, 2, dep2, 0),      // zero amount → InvalidAmount
+    ];
+    assert_eq!(
+        ctx.client.try_batch_lock_funds(&items).unwrap_err().unwrap(),
+        Error::InvalidAmount
+    );
+
+    // Sibling bounty 1 must NOT have been committed
+    assert_eq!(
+        ctx.client.try_get_escrow_info(&1).unwrap_err().unwrap(),
+        Error::BountyNotFound,
+        "sibling bounty 1 must not be stored when a later item fails"
+    );
+}
+
+/// Last item is a duplicate; all preceding valid siblings must NOT be stored.
+#[test]
+fn batch_lock_duplicate_last_item_rolls_back_all_previous_siblings() {
+    let ctx = setup();
+    let dep1 = Address::generate(&ctx.env);
+    let dep2 = Address::generate(&ctx.env);
+    let dep3 = Address::generate(&ctx.env);
+    mint(&ctx, &dep1, AMOUNT);
+    mint(&ctx, &dep2, AMOUNT);
+    mint(&ctx, &dep3, AMOUNT);
+
+    let items = vec![
+        &ctx.env,
+        lock_item(&ctx, 10, dep1, AMOUNT),
+        lock_item(&ctx, 11, dep2, AMOUNT),
+        lock_item(&ctx, 11, dep3, AMOUNT), // dup of bounty 11
+    ];
+    assert_eq!(
+        ctx.client.try_batch_lock_funds(&items).unwrap_err().unwrap(),
+        Error::DuplicateBountyId
+    );
+
+    assert_eq!(
+        ctx.client.try_get_escrow_info(&10).unwrap_err().unwrap(),
+        Error::BountyNotFound,
+        "sibling bounty 10 must not be stored"
+    );
+    assert_eq!(
+        ctx.client.try_get_escrow_info(&11).unwrap_err().unwrap(),
+        Error::BountyNotFound,
+        "sibling bounty 11 must not be stored"
+    );
+}
+// ---------------------------------------------------------------------------
+// Uninitialized contract
+// ---------------------------------------------------------------------------
+
+/// `batch_lock_funds` on an un-initialised contract → `NotInitialized`.
+#[test]
+fn batch_lock_not_initialized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, BountyEscrowContract);
+    let client = BountyEscrowContractClient::new(&env, &contract_id);
+    let depositor = Address::generate(&env);
+
+    let items = vec![
+        &env,
+        LockFundsItem {
+            bounty_id: 1,
+            depositor,
+            amount: 100,
+            deadline: 9_999_999,
+        },
+    ];
+    assert_eq!(
+        client.try_batch_lock_funds(&items).unwrap_err().unwrap(),
+        Error::NotInitialized
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Zero amount
+// ---------------------------------------------------------------------------
+
+/// Single-item batch with `amount = 0` → `InvalidAmount`.
+#[test]
+fn batch_lock_zero_amount_fails() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT);
+    let items = vec![&ctx.env, lock_item(&ctx, 1, depositor, 0)];
+    assert_eq!(
+        ctx.client.try_batch_lock_funds(&items).unwrap_err().unwrap(),
+        Error::InvalidAmount
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auth deduplication
+// ---------------------------------------------------------------------------
+
+/// One depositor appearing in multiple items must succeed; `require_auth` is
+/// called only once per unique address internally.
+#[test]
+fn batch_lock_same_depositor_multiple_bounties_succeeds() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT * 3);
+
+    let items = vec![
+        &ctx.env,
+        lock_item(&ctx, 100, depositor.clone(), AMOUNT),
+        lock_item(&ctx, 101, depositor.clone(), AMOUNT),
+        lock_item(&ctx, 102, depositor.clone(), AMOUNT),
+    ];
+    assert_eq!(ctx.client.batch_lock_funds(&items), 3);
+}
+
+// ===========================================================================
+// BATCH RELEASE FUNDS — failure modes
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Batch size boundaries
+// ---------------------------------------------------------------------------
+
+/// Empty batch must return `InvalidBatchSize`.
+#[test]
+fn batch_release_empty_batch_fails() {
+    let ctx = setup();
+    let empty: Vec<ReleaseFundsItem> = Vec::new(&ctx.env);
+    assert_eq!(
+        ctx.client.try_batch_release_funds(&empty).unwrap_err().unwrap(),
+        Error::InvalidBatchSize
+    );
+}
+
+/// A single-item release batch must succeed.
+#[test]
+fn batch_release_single_item_succeeds() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    let contributor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT);
+    lock_one(&ctx, &depositor, 1);
+
+    let items = vec![
+        &ctx.env,
+        ReleaseFundsItem { bounty_id: 1, contributor },
+    ];
+    assert_eq!(ctx.client.batch_release_funds(&items), 1);
+}
+
+/// A batch of exactly `MAX_BATCH` releases must succeed.
+#[test]
+fn batch_release_exactly_max_batch_size_succeeds() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT * MAX_BATCH as i128);
+
+    for i in 1..=MAX_BATCH as u64 {
+        lock_one(&ctx, &depositor, i);
+    }
+
+    let contributor = Address::generate(&ctx.env);
+    let mut items: Vec<ReleaseFundsItem> = Vec::new(&ctx.env);
+    for i in 1..=MAX_BATCH as u64 {
+        items.push_back(ReleaseFundsItem {
+            bounty_id: i,
+            contributor: contributor.clone(),
         });
     }
+    assert_eq!(ctx.client.batch_release_funds(&items), MAX_BATCH);
+}
 
-    // =========================================================================
-    // BATCH LOCK FUNDS – FAILURE MODES
-    // =========================================================================
+/// A batch of `MAX_BATCH + 1` releases → `InvalidBatchSize`.
+#[test]
+fn batch_release_exceeds_max_batch_size_fails() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT * (MAX_BATCH as i128 + 1));
 
-    // -------------------------------------------------------------------------
-    // Batch size boundary tests
-    // -------------------------------------------------------------------------
-
-    /// An empty batch must return `InvalidBatchSize`.
-    #[test]
-    fn batch_lock_empty_batch_fails() {
-        let (env, client, _admin, _token_admin, _token_id) = setup();
-        let empty: Vec<LockFundsItem> = Vec::new(&env);
-        let result = client.try_batch_lock_funds(&empty);
-        assert_eq!(result, Err(Ok(Error::InvalidBatchSize)));
+    for i in 1..=(MAX_BATCH + 1) as u64 {
+        lock_one(&ctx, &depositor, i);
     }
 
-    /// A batch of exactly 1 item (minimum valid) must succeed.
-    #[test]
-    fn batch_lock_single_item_succeeds() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let depositor = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &depositor, 1_000);
+    let contributor = Address::generate(&ctx.env);
+    let mut items: Vec<ReleaseFundsItem> = Vec::new(&ctx.env);
+    for i in 1..=(MAX_BATCH + 1) as u64 {
+        items.push_back(ReleaseFundsItem {
+            bounty_id: i,
+            contributor: contributor.clone(),
+        });
+    }
+    assert_eq!(
+        ctx.client.try_batch_release_funds(&items).unwrap_err().unwrap(),
+        Error::InvalidBatchSize
+    );
+}
 
-        let deadline = env.ledger().timestamp() + 3_600;
-        let items = vec![&env, lock_item(&env, 1, depositor, 1_000, deadline)];
+// ---------------------------------------------------------------------------
+// Duplicate bounty_id
+// ---------------------------------------------------------------------------
 
-        let locked = client.batch_lock_funds(&items);
-        assert_eq!(locked, 1);
+/// Two release items with the same `bounty_id` → `DuplicateBountyId`.
+#[test]
+fn batch_release_duplicate_bounty_id_within_batch_fails() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT);
+    lock_one(&ctx, &depositor, 5);
+
+    let items = vec![
+        &ctx.env,
+        ReleaseFundsItem { bounty_id: 5, contributor: Address::generate(&ctx.env) },
+        ReleaseFundsItem { bounty_id: 5, contributor: Address::generate(&ctx.env) },
+    ];
+    assert_eq!(
+        ctx.client.try_batch_release_funds(&items).unwrap_err().unwrap(),
+        Error::DuplicateBountyId
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BountyNotFound
+// ---------------------------------------------------------------------------
+
+/// Releasing a bounty that was never locked → `BountyNotFound`.
+#[test]
+fn batch_release_nonexistent_bounty_fails() {
+    let ctx = setup();
+    let items = vec![
+        &ctx.env,
+        ReleaseFundsItem {
+            bounty_id: 9999,
+            contributor: Address::generate(&ctx.env),
+        },
+    ];
+    assert_eq!(
+        ctx.client.try_batch_release_funds(&items).unwrap_err().unwrap(),
+        Error::BountyNotFound
+    );
+}
+
+/// Second item is nonexistent; the first valid sibling must remain Locked.
+///
+/// Security note: this is the canonical "sibling protection" test for release.
+/// The failing row must not cause the preceding valid row to be partially
+/// released — no funds may leave the contract.
+#[test]
+fn batch_release_nonexistent_second_item_rolls_back_first_sibling() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT);
+    lock_one(&ctx, &depositor, 1);
+
+    let items = vec![
+        &ctx.env,
+        ReleaseFundsItem { bounty_id: 1, contributor: Address::generate(&ctx.env) }, // valid
+        ReleaseFundsItem { bounty_id: 9999, contributor: Address::generate(&ctx.env) }, // missing
+    ];
+    assert_eq!(
+        ctx.client.try_batch_release_funds(&items).unwrap_err().unwrap(),
+        Error::BountyNotFound
+    );
+
+    assert_eq!(
+        ctx.client.get_escrow_info(&1).status,
+        crate::EscrowStatus::Locked,
+        "sibling bounty 1 must remain Locked after its neighbour caused a rollback"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FundsNotLocked
+// ---------------------------------------------------------------------------
+
+/// Releasing a bounty whose status is already `Released` → `FundsNotLocked`.
+#[test]
+fn batch_release_already_released_bounty_fails() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT);
+    lock_one(&ctx, &depositor, 7);
+
+    ctx.client.release_funds(&7, &Address::generate(&ctx.env));
+
+    let items = vec![
+        &ctx.env,
+        ReleaseFundsItem { bounty_id: 7, contributor: Address::generate(&ctx.env) },
+    ];
+    assert_eq!(
+        ctx.client.try_batch_release_funds(&items).unwrap_err().unwrap(),
+        Error::FundsNotLocked
+    );
+}
+
+/// A batch that mixes a Locked bounty with a Refunded one → `FundsNotLocked`;
+/// the Locked sibling must remain untouched (no premature fund release).
+#[test]
+fn batch_release_mixed_locked_and_refunded_is_atomic() {
+    let ctx = setup();
+    let dep1 = Address::generate(&ctx.env);
+    let dep2 = Address::generate(&ctx.env);
+    let short_deadline = ctx.env.ledger().timestamp() + 1;
+
+    mint(&ctx, &dep1, AMOUNT);
+    mint(&ctx, &dep2, AMOUNT);
+
+    ctx.client.lock_funds(
+        &dep1,
+        &20,
+        &AMOUNT,
+        &(ctx.env.ledger().timestamp() + DEADLINE_OFFSET),
+    );
+    ctx.client.lock_funds(&dep2, &21, &AMOUNT, &short_deadline);
+
+    // Advance past the short deadline and refund bounty 21
+    advance_time(&ctx, 10);
+    ctx.client.refund(&21);
+
+    let items = vec![
+        &ctx.env,
+        ReleaseFundsItem { bounty_id: 20, contributor: Address::generate(&ctx.env) }, // Locked
+        ReleaseFundsItem { bounty_id: 21, contributor: Address::generate(&ctx.env) }, // Refunded
+    ];
+    assert_eq!(
+        ctx.client.try_batch_release_funds(&items).unwrap_err().unwrap(),
+        Error::FundsNotLocked
+    );
+
+    assert_eq!(
+        ctx.client.get_escrow_info(&20).status,
+        crate::EscrowStatus::Locked,
+        "locked sibling must not be released when a refunded sibling fails"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Uninitialized contract
+// ---------------------------------------------------------------------------
+
+/// `batch_release_funds` on an un-initialised contract → `NotInitialized`.
+#[test]
+fn batch_release_not_initialized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, BountyEscrowContract);
+    let client = BountyEscrowContractClient::new(&env, &contract_id);
+
+    let items = vec![
+        &env,
+        ReleaseFundsItem { bounty_id: 1, contributor: Address::generate(&env) },
+    ];
+    assert_eq!(
+        client.try_batch_release_funds(&items).unwrap_err().unwrap(),
+        Error::NotInitialized
+    );
+}
+
+// ===========================================================================
+// CROSS-CUTTING — partial failure atomicity over multiple bounties
+// ===========================================================================
+
+/// Lock 3 bounties; release two individually; then attempt a batch-release
+/// that includes an already-released bounty alongside a still-Locked one.
+/// The whole batch must fail and the Locked sibling must remain unaffected.
+#[test]
+fn batch_release_partial_failure_leaves_all_siblings_locked() {
+    let ctx = setup();
+    let depositor = Address::generate(&ctx.env);
+    mint(&ctx, &depositor, AMOUNT * 3);
+
+    for id in [30u64, 31, 32] {
+        lock_one(&ctx, &depositor, id);
     }
 
-    /// A batch exceeding MAX_BATCH_SIZE (100) must return `InvalidBatchSize`.
-    /// We use 101 items to cross the boundary.
-    #[test]
-    fn batch_lock_exceeds_max_batch_size_fails() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        let mut items: Vec<LockFundsItem> = Vec::new(&env);
-        for i in 0..101u64 {
-            let depositor = Address::generate(&env);
-            mint(&env, &token_id, &token_admin, &depositor, 100);
-            items.push_back(lock_item(&env, i, depositor, 100, deadline));
-        }
-
-        let result = client.try_batch_lock_funds(&items);
-        assert_eq!(result, Err(Ok(Error::InvalidBatchSize)));
-    }
-
-    /// A batch of exactly MAX_BATCH_SIZE (100) items must succeed.
-    #[test]
-    fn batch_lock_exactly_max_batch_size_succeeds() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        let mut items: Vec<LockFundsItem> = Vec::new(&env);
-        for i in 0..100u64 {
-            let depositor = Address::generate(&env);
-            mint(&env, &token_id, &token_admin, &depositor, 100);
-            items.push_back(lock_item(&env, i, depositor, 100, deadline));
-        }
-
-        let locked = client.batch_lock_funds(&items);
-        assert_eq!(locked, 100);
-    }
-
-    // -------------------------------------------------------------------------
-    // Duplicate bounty ID tests
-    // -------------------------------------------------------------------------
-
-    /// Two items sharing the same `bounty_id` within one batch → `DuplicateBountyId`.
-    #[test]
-    fn batch_lock_duplicate_bounty_id_within_batch_fails() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        let dep1 = Address::generate(&env);
-        let dep2 = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &dep1, 500);
-        mint(&env, &token_id, &token_admin, &dep2, 500);
-
-        // Both use bounty_id = 99
-        let items = vec![
-            &env,
-            lock_item(&env, 99, dep1, 500, deadline),
-            lock_item(&env, 99, dep2, 500, deadline),
-        ];
-
-        let result = client.try_batch_lock_funds(&items);
-        assert_eq!(result, Err(Ok(Error::DuplicateBountyId)));
-    }
-
-    /// Duplicate ID that also already exists in storage → `BountyExists`.
-    #[test]
-    fn batch_lock_bounty_id_already_exists_in_storage_fails() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        // Pre-lock bounty 42 via the single-lock path
-        let depositor = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &depositor, 2_000);
-        client.lock_funds(&depositor, &42, &1_000, &deadline);
-
-        // Now try to batch-lock using the same bounty_id
-        let dep2 = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &dep2, 500);
-        let items = vec![&env, lock_item(&env, 42, dep2, 500, deadline)];
-
-        let result = client.try_batch_lock_funds(&items);
-        assert_eq!(result, Err(Ok(Error::BountyExists)));
-    }
-
-    // -------------------------------------------------------------------------
-    // Mixed validity (some items invalid) – atomicity tests
-    // -------------------------------------------------------------------------
-
-    /// When the *second* item has a zero amount the whole batch must fail and
-    /// the *first* (valid) item must NOT have been stored.
-    #[test]
-    fn batch_lock_invalid_amount_in_second_item_rolls_back_first() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        let dep1 = Address::generate(&env);
-        let dep2 = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &dep1, 1_000);
-
-        let items = vec![
-            &env,
-            lock_item(&env, 1, dep1.clone(), 1_000, deadline), // valid
-            lock_item(&env, 2, dep2.clone(), 0, deadline),     // zero amount → invalid
-        ];
-
-        let result = client.try_batch_lock_funds(&items);
-        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-
-        // Bounty 1 must NOT exist because the transaction was atomic
-        let info = client.try_get_escrow_info(&1);
-        assert_eq!(info, Err(Ok(Error::BountyNotFound)));
-    }
-
-    /// When the *last* item has a duplicate ID the whole batch fails and
-    /// earlier valid items are not persisted.
-    #[test]
-    fn batch_lock_duplicate_in_last_item_rolls_back_all_previous() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        let dep1 = Address::generate(&env);
-        let dep2 = Address::generate(&env);
-        let dep3 = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &dep1, 100);
-        mint(&env, &token_id, &token_admin, &dep2, 100);
-        mint(&env, &token_id, &token_admin, &dep3, 100);
-
-        let items = vec![
-            &env,
-            lock_item(&env, 10, dep1.clone(), 100, deadline),
-            lock_item(&env, 11, dep2.clone(), 100, deadline),
-            lock_item(&env, 11, dep3.clone(), 100, deadline), // dup of bounty 11
-        ];
-
-        let result = client.try_batch_lock_funds(&items);
-        assert_eq!(result, Err(Ok(Error::DuplicateBountyId)));
-
-        // Bounties 10 and 11 must not exist
-        assert_eq!(
-            client.try_get_escrow_info(&10),
-            Err(Ok(Error::BountyNotFound))
-        );
-        assert_eq!(
-            client.try_get_escrow_info(&11),
-            Err(Ok(Error::BountyNotFound))
-        );
-    }
-
-    /// Contract must be initialized before batch locking.
-    #[test]
-    fn batch_lock_not_initialized_fails() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        // Register contract WITHOUT calling init
-        let contract_id = env.register_contract(None, BountyEscrowContract);
-        let client = BountyEscrowContractClient::new(&env, &contract_id);
-
-        // We need a real token address just to build the item; use a dummy address
-        let depositor = Address::generate(&env);
-        let items = vec![
-            &env,
-            LockFundsItem {
-                bounty_id: 1,
-                depositor,
-                amount: 100,
-                deadline: 9_999_999,
-                non_transferable_rewards: false,
-            },
-        ];
-
-        let result = client.try_batch_lock_funds(&items);
-        assert_eq!(result, Err(Ok(Error::NotInitialized)));
-    }
-
-    // =========================================================================
-    // BATCH RELEASE FUNDS – FAILURE MODES
-    // =========================================================================
-
-    // -------------------------------------------------------------------------
-    // Batch size boundary tests
-    // -------------------------------------------------------------------------
-
-    /// An empty batch must return `InvalidBatchSize`.
-    #[test]
-    fn batch_release_empty_batch_fails() {
-        let (env, client, _admin, _token_admin, _token_id) = setup();
-        let empty: Vec<ReleaseFundsItem> = Vec::new(&env);
-        let result = client.try_batch_release_funds(&empty);
-        assert_eq!(result, Err(Ok(Error::InvalidBatchSize)));
-    }
-
-    /// A batch of exactly 1 item (minimum valid) must succeed.
-    #[test]
-    fn batch_release_single_item_succeeds() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let depositor = Address::generate(&env);
-        let contributor = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &depositor, 1_000);
-
-        let deadline = env.ledger().timestamp() + 3_600;
-        client.lock_funds(&depositor, &1, &1_000, &deadline);
-
-        let items = vec![
-            &env,
-            ReleaseFundsItem {
-                bounty_id: 1,
-                contributor,
-            },
-        ];
-        let released = client.batch_release_funds(&items);
-        assert_eq!(released, 1);
-    }
-
-    /// A batch exceeding MAX_BATCH_SIZE (100) must return `InvalidBatchSize`.
-    #[test]
-    fn batch_release_exceeds_max_batch_size_fails() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        // Lock 101 bounties with a single depositor to stay within budget
-        let depositor = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &depositor, 101 * 100);
-
-        let mut lock_items: Vec<LockFundsItem> = Vec::new(&env);
-        for i in 0..101u64 {
-            lock_items.push_back(lock_item(&env, i, depositor.clone(), 100, deadline));
-        }
-        // Lock in two smaller batches to avoid budget issues during setup
-        let first_50: Vec<LockFundsItem> = lock_items.slice(0..50);
-        let next_51: Vec<LockFundsItem> = lock_items.slice(50..101);
-        client.batch_lock_funds(&first_50);
-        client.batch_lock_funds(&next_51);
-
-        let mut items: Vec<ReleaseFundsItem> = Vec::new(&env);
-        for i in 0..101u64 {
-            items.push_back(ReleaseFundsItem {
-                bounty_id: i,
-                contributor: Address::generate(&env),
-            });
-        }
-
-        let result = client.try_batch_release_funds(&items);
-        assert_eq!(result, Err(Ok(Error::InvalidBatchSize)));
-    }
-
-    // -------------------------------------------------------------------------
-    // Duplicate bounty ID tests
-    // -------------------------------------------------------------------------
-
-    /// Two release items sharing the same `bounty_id` → `DuplicateBountyId`.
-    #[test]
-    fn batch_release_duplicate_bounty_id_within_batch_fails() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let depositor = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &depositor, 1_000);
-        let deadline = env.ledger().timestamp() + 3_600;
-        client.lock_funds(&depositor, &5, &1_000, &deadline);
-
-        let c1 = Address::generate(&env);
-        let c2 = Address::generate(&env);
-        let items = vec![
-            &env,
-            ReleaseFundsItem {
-                bounty_id: 5,
-                contributor: c1,
-            },
-            ReleaseFundsItem {
-                bounty_id: 5,
-                contributor: c2,
-            },
-        ];
-
-        let result = client.try_batch_release_funds(&items);
-        assert_eq!(result, Err(Ok(Error::DuplicateBountyId)));
-    }
-
-    // -------------------------------------------------------------------------
-    // BountyNotFound tests
-    // -------------------------------------------------------------------------
-
-    /// Releasing a bounty that was never locked → `BountyNotFound`.
-    #[test]
-    fn batch_release_nonexistent_bounty_fails() {
-        let (env, client, _admin, _token_admin, _token_id) = setup();
-        let contributor = Address::generate(&env);
-        let items = vec![
-            &env,
-            ReleaseFundsItem {
-                bounty_id: 9999,
-                contributor,
-            },
-        ];
-
-        let result = client.try_batch_release_funds(&items);
-        assert_eq!(result, Err(Ok(Error::BountyNotFound)));
-    }
-
-    /// Second item does not exist; first valid item must NOT be released (atomicity).
-    #[test]
-    fn batch_release_nonexistent_second_item_rolls_back_first() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let depositor = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &depositor, 1_000);
-        let deadline = env.ledger().timestamp() + 3_600;
-        client.lock_funds(&depositor, &1, &1_000, &deadline);
-
-        let c1 = Address::generate(&env);
-        let items = vec![
-            &env,
-            ReleaseFundsItem {
-                bounty_id: 1,
-                contributor: c1,
-            }, // valid
-            ReleaseFundsItem {
-                bounty_id: 9999,
-                contributor: Address::generate(&env),
-            }, // missing
-        ];
-
-        let result = client.try_batch_release_funds(&items);
-        assert_eq!(result, Err(Ok(Error::BountyNotFound)));
-
-        // Bounty 1 must still be Locked (not Released)
-        let escrow = client.get_escrow_info(&1);
-        assert_eq!(escrow.status, crate::EscrowStatus::Locked);
-    }
-
-    // -------------------------------------------------------------------------
-    // FundsNotLocked tests
-    // -------------------------------------------------------------------------
-
-    /// Releasing a bounty that was already released → `FundsNotLocked`.
-    #[test]
-    fn batch_release_already_released_bounty_fails() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let depositor = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &depositor, 1_000);
-        let deadline = env.ledger().timestamp() + 3_600;
-        client.lock_funds(&depositor, &7, &1_000, &deadline);
-
-        let contributor = Address::generate(&env);
-        // First release succeeds
-        client.release_funds(&7, &contributor);
-
-        // Try to batch-release the same bounty again
-        let c2 = Address::generate(&env);
-        let items = vec![
-            &env,
-            ReleaseFundsItem {
-                bounty_id: 7,
-                contributor: c2,
-            },
-        ];
-        let result = client.try_batch_release_funds(&items);
-        assert_eq!(result, Err(Ok(Error::FundsNotLocked)));
-    }
-
-    /// A mix of valid and already-refunded bounties: the refunded one triggers
-    /// `FundsNotLocked` and the whole batch fails without releasing the valid one.
-    #[test]
-    fn batch_release_mixed_locked_and_refunded_fails_atomically() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let deadline = env.ledger().timestamp() + 1; // very short deadline
-        let dep1 = Address::generate(&env);
-        let dep2 = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &dep1, 500);
-        mint(&env, &token_id, &token_admin, &dep2, 500);
-
-        client.lock_funds(&dep1, &20, &500, &deadline);
-        client.lock_funds(&dep2, &21, &500, &deadline);
-
-        // Advance past deadline and refund bounty 21
-        advance_time(&env, 10);
-        client.refund(&21, &None, &None, &crate::RefundMode::Full);
-
-        // Now try batch release: bounty 20 is Locked (valid), bounty 21 is Refunded (invalid)
-        let c1 = Address::generate(&env);
-        let c2 = Address::generate(&env);
-        let items = vec![
-            &env,
-            ReleaseFundsItem {
-                bounty_id: 20,
-                contributor: c1,
-            },
-            ReleaseFundsItem {
-                bounty_id: 21,
-                contributor: c2,
-            },
-        ];
-
-        let result = client.try_batch_release_funds(&items);
-        assert_eq!(result, Err(Ok(Error::FundsNotLocked)));
-
-        // Bounty 20 must remain Locked
-        let escrow = client.get_escrow_info(&20);
-        assert_eq!(escrow.status, crate::EscrowStatus::Locked);
-    }
-
-    // -------------------------------------------------------------------------
-    // Authorization tests
-    // -------------------------------------------------------------------------
-
-    /// Contract must be initialized before batch releasing.
-    #[test]
-    fn batch_release_not_initialized_fails() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, BountyEscrowContract);
-        let client = BountyEscrowContractClient::new(&env, &contract_id);
-
-        let items = vec![
-            &env,
-            ReleaseFundsItem {
-                bounty_id: 1,
-                contributor: Address::generate(&env),
-            },
-        ];
-
-        let result = client.try_batch_release_funds(&items);
-        assert_eq!(result, Err(Ok(Error::NotInitialized)));
-    }
-
-    // =========================================================================
-    // CROSS-CUTTING: partial failure atomicity
-    // =========================================================================
-
-    /// Lock 3 bounties. Batch-release the first two normally, then attempt a
-    /// second batch that includes one already-released bounty and one fresh one.
-    /// The whole second batch must fail and the fresh bounty must remain Locked.
-    #[test]
-    fn batch_release_partial_failure_does_not_release_any() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        let mut depositors = Vec::new(&env);
-        for i in 30..33u64 {
-            let dep = Address::generate(&env);
-            mint(&env, &token_id, &token_admin, &dep, 200);
-            client.lock_funds(&dep, &i, &200, &deadline);
-            depositors.push_back(dep);
-        }
-
-        // Release bounties 30 and 31 via individual calls
-        client.release_funds(&30, &Address::generate(&env));
-        client.release_funds(&31, &Address::generate(&env));
-
-        // Batch that includes already-released 30 and fresh 32
-        let items = vec![
-            &env,
-            ReleaseFundsItem {
-                bounty_id: 30,
-                contributor: Address::generate(&env),
-            }, // already released
-            ReleaseFundsItem {
-                bounty_id: 32,
-                contributor: Address::generate(&env),
-            }, // still locked
-        ];
-
-        let result = client.try_batch_release_funds(&items);
-        assert_eq!(result, Err(Ok(Error::FundsNotLocked)));
-
-        // Bounty 32 must still be Locked
-        let escrow32 = client.get_escrow_info(&32);
-        assert_eq!(escrow32.status, crate::EscrowStatus::Locked);
-    }
-
-    // =========================================================================
-    // EDGE CASES
-    // =========================================================================
-
-    /// `batch_lock_funds` with a single depositor appearing multiple times should
-    /// still work (auth is required once per unique address).
-    #[test]
-    fn batch_lock_same_depositor_multiple_bounties_succeeds() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let depositor = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &depositor, 3_000);
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        let items = vec![
-            &env,
-            lock_item(&env, 100, depositor.clone(), 1_000, deadline),
-            lock_item(&env, 101, depositor.clone(), 1_000, deadline),
-            lock_item(&env, 102, depositor.clone(), 1_000, deadline),
-        ];
-
-        let locked = client.batch_lock_funds(&items);
-        assert_eq!(locked, 3);
-    }
-
-    /// Batch lock with amount=0 for any item → `InvalidAmount`.
-    #[test]
-    fn batch_lock_zero_amount_fails() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let depositor = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &depositor, 1_000);
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        let items = vec![&env, lock_item(&env, 1, depositor, 0, deadline)];
-        let result = client.try_batch_lock_funds(&items);
-        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-    }
-
-    /// `batch_release_funds` on a batch of exactly MAX_BATCH_SIZE items should succeed.
-    /// `batch_release_funds` on a batch of exactly MAX_BATCH_SIZE items should succeed.
-    #[test]
-    fn batch_release_exactly_max_batch_size_succeeds() {
-        let (env, client, _admin, token_admin, token_id) = setup();
-        let deadline = env.ledger().timestamp() + 3_600;
-
-        // Use a single depositor for all 100 locks to stay within budget
-        let depositor = Address::generate(&env);
-        mint(&env, &token_id, &token_admin, &depositor, 100 * 10);
-
-        let mut lock_items: Vec<LockFundsItem> = Vec::new(&env);
-        for i in 0..100u64 {
-            lock_items.push_back(lock_item(&env, i, depositor.clone(), 10, deadline));
-        }
-        client.batch_lock_funds(&lock_items);
-
-        // Use a single contributor for all releases
-        let contributor = Address::generate(&env);
-        let mut release_items: Vec<ReleaseFundsItem> = Vec::new(&env);
-        for i in 0..100u64 {
-            release_items.push_back(ReleaseFundsItem {
-                bounty_id: i,
-                contributor: contributor.clone(),
-            });
-        }
-
-        let released = client.batch_release_funds(&release_items);
-        assert_eq!(released, 100);
-    }
+    ctx.client.release_funds(&30, &Address::generate(&ctx.env));
+    ctx.client.release_funds(&31, &Address::generate(&ctx.env));
+
+    // Batch: already-released 30 + still-Locked 32
+    let items = vec![
+        &ctx.env,
+        ReleaseFundsItem { bounty_id: 30, contributor: Address::generate(&ctx.env) }, // Released → invalid
+        ReleaseFundsItem { bounty_id: 32, contributor: Address::generate(&ctx.env) }, // Locked (valid sibling)
+    ];
+    assert_eq!(
+        ctx.client.try_batch_release_funds(&items).unwrap_err().unwrap(),
+        Error::FundsNotLocked
+    );
+
+    assert_eq!(
+        ctx.client.get_escrow_info(&32).status,
+        crate::EscrowStatus::Locked,
+        "bounty 32 must remain Locked; its sibling's failure must not release it"
+    );
 }

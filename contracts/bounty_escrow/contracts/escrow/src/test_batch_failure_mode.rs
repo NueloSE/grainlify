@@ -1,10 +1,23 @@
 // ============================================================
-// FILE: contracts/bounty_escrow/contracts/escrow/src/test_batch_failure_modes.rs
+// FILE: contracts/bounty_escrow/contracts/escrow/src/test_batch_failure_mode.rs
 //
-// Comprehensive failure-mode tests for batch_lock_funds and
-// batch_release_funds (Issue #461).
+// Batch failure mode matrix for batch_lock_funds and batch_release_funds.
 //
-// Coverage:
+// ## Batch Failure Semantics
+//
+// Both batch operations are **strictly atomic** (all-or-nothing):
+//
+// - All items are validated in a single pass *before* any state is mutated.
+// - If any item fails validation the entire transaction is reverted; no partial
+//   state changes occur and no token transfers are performed.
+// - "Sibling" rows (valid items in the same batch as the failing row) are
+//   never written to storage — failed rows cannot corrupt their siblings.
+// - After a failed batch the contract remains in exactly the same state as
+//   before the call, and subsequent single-item or batch operations behave
+//   as if the failed call never happened.
+//
+// ## Coverage
+//
 //   BATCH LOCK
 //     - Empty batch rejected (InvalidBatchSize)
 //     - Single-item batch accepted (boundary: min = 1)
@@ -16,9 +29,13 @@
 //     - Negative amount item rejected (InvalidAmount)
 //     - Contract not initialised rejected (NotInitialized)
 //     - Paused lock operation rejected (FundsPaused)
+//     - Deprecated contract rejected (ContractDeprecated)
 //     - Mixed batch: one bad item among valid ones → all-or-nothing
 //     - Mixed batch: first item invalid, rest valid → no partial effect
 //     - Mixed batch: last item invalid, rest valid → no partial effect
+//     - Multiple depositors in one batch: all valid → all locked
+//     - Multiple depositors in one batch: one fails → none locked
+//     - Token balances unchanged after failed batch lock
 //
 //   BATCH RELEASE
 //     - Empty batch rejected (InvalidBatchSize)
@@ -34,6 +51,8 @@
 //     - Mixed batch: one already-released bounty → atomicity
 //     - Mixed batch: first item invalid → no partial effect
 //     - Mixed batch: last item invalid → no partial effect
+//     - Token balances unchanged after failed batch release
+//     - Contributor balances unchanged after failed batch release
 // ============================================================
 
 #![cfg(test)]
@@ -155,11 +174,7 @@ impl<'a> TestCtx<'a> {
     fn assert_no_escrow(&self, id: u64) {
         self.env.as_contract(&self.contract_id, || {
             assert!(
-                !self
-                    .env
-                    .storage()
-                    .persistent()
-                    .has(&DataKey::Escrow(id)),
+                !self.env.storage().persistent().has(&DataKey::Escrow(id)),
                 "bounty {id} should not exist in storage"
             );
         });
@@ -172,6 +187,11 @@ impl<'a> TestCtx<'a> {
             escrow.status, status,
             "bounty {id} status mismatch: expected {status:?}"
         );
+    }
+
+    /// Return the token balance for `address` using the standard token client.
+    fn token_balance(&self, address: &Address) -> i128 {
+        token::Client::new(&self.env, &self.token_id).balance(address)
     }
 }
 
@@ -690,4 +710,345 @@ fn failed_batch_lock_does_not_corrupt_state_for_subsequent_single_lock() {
     // Normal single lock should succeed
     ctx.lock_one(1);
     ctx.assert_escrow_status(1, EscrowStatus::Locked);
+}
+
+// ===========================================================================
+// BATCH LOCK — deprecated contract tests
+// ===========================================================================
+
+/// batch_lock_funds must be rejected when the contract is marked deprecated.
+/// Existing escrows must remain unaffected (release / refund still work).
+#[test]
+fn batch_lock_deprecated_contract_is_rejected() {
+    let ctx = TestCtx::new();
+
+    // Deprecate the contract (admin only)
+    ctx.client.set_deprecated(&true, &None);
+
+    let items = ctx.build_lock_batch(2);
+    let result = ctx.client.try_batch_lock_funds(&items);
+    assert_eq!(result.unwrap_err().unwrap(), Error::ContractDeprecated);
+
+    ctx.assert_no_escrow(1);
+    ctx.assert_no_escrow(2);
+}
+
+/// A batch that was started before deprecation is checked AFTER reentrancy
+/// acquire but BEFORE any state mutation; the deprecation flag therefore
+/// blocks the whole batch with no side-effects.
+#[test]
+fn batch_lock_deprecated_does_not_corrupt_previously_locked_escrows() {
+    let ctx = TestCtx::new();
+
+    // Lock bounty 1 while the contract is still live
+    ctx.lock_one(1);
+    ctx.assert_escrow_status(1, EscrowStatus::Locked);
+
+    // Now deprecate
+    ctx.client.set_deprecated(&true, &None);
+
+    // Attempt batch lock of bounties 2 and 3
+    let mut items = Vec::new(&ctx.env);
+    items.push_back(ctx.lock_item(2));
+    items.push_back(ctx.lock_item(3));
+    let _ = ctx.client.try_batch_lock_funds(&items);
+
+    // Previously locked bounty must be untouched
+    ctx.assert_escrow_status(1, EscrowStatus::Locked);
+    ctx.assert_no_escrow(2);
+    ctx.assert_no_escrow(3);
+}
+
+/// Batch release still succeeds on a deprecated contract (existing escrows
+/// must be releasable so contributors are not locked out permanently).
+#[test]
+fn batch_release_still_works_when_contract_is_deprecated() {
+    let ctx = TestCtx::new();
+    ctx.lock_one(1);
+    ctx.lock_one(2);
+
+    // Deprecate after locking
+    ctx.client.set_deprecated(&true, &None);
+
+    let items = ctx.build_release_batch(2);
+    let count = ctx.client.batch_release_funds(&items);
+    assert_eq!(count, 2);
+
+    ctx.assert_escrow_status(1, EscrowStatus::Released);
+    ctx.assert_escrow_status(2, EscrowStatus::Released);
+}
+
+// ===========================================================================
+// BATCH LOCK — token balance integrity after failure
+// ===========================================================================
+
+/// Depositor token balance must be unchanged after a failed batch lock.
+/// No tokens should have been transferred out.
+#[test]
+fn batch_lock_failure_does_not_deduct_depositor_tokens() {
+    let ctx = TestCtx::new();
+
+    let initial_balance = ctx.token_balance(&ctx.depositor);
+
+    // Build a batch where the last item has a zero amount — will fail
+    let mut items = Vec::new(&ctx.env);
+    items.push_back(ctx.lock_item(1));
+    items.push_back(ctx.lock_item(2));
+    items.push_back(LockFundsItem {
+        bounty_id: 3,
+        depositor: ctx.depositor.clone(),
+        amount: 0, // invalid
+        deadline: ctx.deadline(),
+    });
+
+    let _ = ctx.client.try_batch_lock_funds(&items);
+
+    // Token balance must be exactly the same as before the call
+    assert_eq!(
+        ctx.token_balance(&ctx.depositor),
+        initial_balance,
+        "depositor balance must not change after a failed batch lock"
+    );
+}
+
+/// Contract token balance must be unchanged after a failed batch lock.
+#[test]
+fn batch_lock_failure_does_not_credit_contract_tokens() {
+    let ctx = TestCtx::new();
+
+    let contract_balance_before = ctx.token_balance(&ctx.contract_id);
+
+    let mut items = Vec::new(&ctx.env);
+    items.push_back(ctx.lock_item(10));
+    items.push_back(ctx.lock_item(10)); // duplicate
+
+    let _ = ctx.client.try_batch_lock_funds(&items);
+
+    assert_eq!(
+        ctx.token_balance(&ctx.contract_id),
+        contract_balance_before,
+        "contract balance must not change after a failed batch lock"
+    );
+}
+
+// ===========================================================================
+// BATCH RELEASE — token balance integrity after failure
+// ===========================================================================
+
+/// Contributor token balance must be unchanged after a failed batch release.
+#[test]
+fn batch_release_failure_does_not_credit_contributor_tokens() {
+    let ctx = TestCtx::new();
+    ctx.lock_one(1);
+
+    let contributor_balance_before = ctx.token_balance(&ctx.contributor);
+    let contract_balance_before = ctx.token_balance(&ctx.contract_id);
+
+    // Include a nonexistent bounty to force failure
+    let mut items = Vec::new(&ctx.env);
+    items.push_back(ctx.release_item(1));
+    items.push_back(ctx.release_item(999)); // nonexistent
+
+    let _ = ctx.client.try_batch_release_funds(&items);
+
+    assert_eq!(
+        ctx.token_balance(&ctx.contributor),
+        contributor_balance_before,
+        "contributor balance must not change after a failed batch release"
+    );
+    assert_eq!(
+        ctx.token_balance(&ctx.contract_id),
+        contract_balance_before,
+        "contract balance must not change after a failed batch release"
+    );
+}
+
+// ===========================================================================
+// BATCH LOCK — multiple depositors
+// ===========================================================================
+
+/// A batch with distinct depositors (each with their own balance) must lock
+/// all bounties and deduct from each depositor individually.
+#[test]
+fn batch_lock_multiple_depositors_all_valid_succeeds() {
+    let ctx = TestCtx::new();
+
+    let dep2 = Address::generate(&ctx.env);
+    ctx.token_sac.mint(&dep2, &AMOUNT);
+
+    let mut items = Vec::new(&ctx.env);
+    items.push_back(ctx.lock_item(1)); // depositor = ctx.depositor
+    items.push_back(LockFundsItem {
+        bounty_id: 2,
+        depositor: dep2.clone(),
+        amount: AMOUNT,
+        deadline: ctx.deadline(),
+    });
+
+    let count = ctx.client.batch_lock_funds(&items);
+    assert_eq!(count, 2);
+
+    ctx.assert_escrow_status(1, EscrowStatus::Locked);
+    ctx.assert_escrow_status(2, EscrowStatus::Locked);
+}
+
+/// When a multi-depositor batch fails (one item invalid), NO depositor is
+/// debited — neither the valid items' depositors nor any other address.
+#[test]
+fn batch_lock_multiple_depositors_one_invalid_none_debited() {
+    let ctx = TestCtx::new();
+
+    let dep2 = Address::generate(&ctx.env);
+    ctx.token_sac.mint(&dep2, &AMOUNT);
+
+    let dep1_balance_before = ctx.token_balance(&ctx.depositor);
+    let dep2_balance_before = ctx.token_balance(&dep2);
+
+    let mut items = Vec::new(&ctx.env);
+    items.push_back(ctx.lock_item(1)); // valid
+    items.push_back(LockFundsItem {
+        bounty_id: 2,
+        depositor: dep2.clone(),
+        amount: 0, // zero → InvalidAmount
+        deadline: ctx.deadline(),
+    });
+
+    let _ = ctx.client.try_batch_lock_funds(&items);
+
+    // Neither depositor should have been debited
+    assert_eq!(ctx.token_balance(&ctx.depositor), dep1_balance_before);
+    assert_eq!(ctx.token_balance(&dep2), dep2_balance_before);
+
+    // Neither escrow should exist
+    ctx.assert_no_escrow(1);
+    ctx.assert_no_escrow(2);
+}
+
+/// Same depositor appearing in multiple items (a repeated depositor) combined
+/// with one invalid sibling causes a full rollback — even the valid items
+/// from that depositor must not be stored.
+#[test]
+fn batch_lock_repeated_depositor_with_one_invalid_causes_full_rollback() {
+    let ctx = TestCtx::new();
+
+    ctx.token_sac.mint(&ctx.depositor, &(AMOUNT * 3));
+    let balance_before = ctx.token_balance(&ctx.depositor);
+
+    let mut items = Vec::new(&ctx.env);
+    items.push_back(ctx.lock_item(10));
+    items.push_back(ctx.lock_item(20));
+    items.push_back(LockFundsItem {
+        bounty_id: 30,
+        depositor: ctx.depositor.clone(),
+        amount: -1, // negative → InvalidAmount
+        deadline: ctx.deadline(),
+    });
+
+    let _ = ctx.client.try_batch_lock_funds(&items);
+
+    assert_eq!(ctx.token_balance(&ctx.depositor), balance_before);
+    ctx.assert_no_escrow(10);
+    ctx.assert_no_escrow(20);
+    ctx.assert_no_escrow(30);
+}
+
+// ===========================================================================
+// BATCH LOCK — not-initialised test
+// ===========================================================================
+
+/// batch_lock_funds must return NotInitialized when called on a contract that
+/// has not been set up via `init`.
+#[test]
+fn batch_lock_not_initialized_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, crate::BountyEscrowContract);
+    let client = crate::BountyEscrowContractClient::new(&env, &contract_id);
+
+    let depositor = Address::generate(&env);
+    let mut items = Vec::new(&env);
+    items.push_back(LockFundsItem {
+        bounty_id: 1,
+        depositor,
+        amount: 100,
+        deadline: 9_999_999,
+    });
+
+    let result = client.try_batch_lock_funds(&items);
+    assert_eq!(result.unwrap_err().unwrap(), Error::NotInitialized);
+}
+
+// ===========================================================================
+// BATCH RELEASE — not-initialised test
+// ===========================================================================
+
+/// batch_release_funds must return NotInitialized when the contract has not
+/// been initialised.
+#[test]
+fn batch_release_not_initialized_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, crate::BountyEscrowContract);
+    let client = crate::BountyEscrowContractClient::new(&env, &contract_id);
+
+    let mut items = Vec::new(&env);
+    items.push_back(crate::ReleaseFundsItem {
+        bounty_id: 1,
+        contributor: Address::generate(&env),
+    });
+
+    let result = client.try_batch_release_funds(&items);
+    assert_eq!(result.unwrap_err().unwrap(), Error::NotInitialized);
+}
+
+// ===========================================================================
+// CROSS-CONCERN — ordering guarantee
+// ===========================================================================
+
+/// Items submitted in reverse bounty_id order must still be processed in
+/// ascending order, producing the same final state as if submitted sorted.
+#[test]
+fn batch_lock_reverse_order_input_produces_same_state_as_sorted() {
+    let ctx = TestCtx::new();
+    ctx.token_sac.mint(&ctx.depositor, &(AMOUNT * 3));
+
+    // Submit in reverse order: 30, 20, 10
+    let mut items = Vec::new(&ctx.env);
+    items.push_back(ctx.lock_item(30));
+    items.push_back(ctx.lock_item(20));
+    items.push_back(ctx.lock_item(10));
+
+    let count = ctx.client.batch_lock_funds(&items);
+    assert_eq!(count, 3);
+
+    // All three must be stored regardless of input order
+    ctx.assert_escrow_status(10, EscrowStatus::Locked);
+    ctx.assert_escrow_status(20, EscrowStatus::Locked);
+    ctx.assert_escrow_status(30, EscrowStatus::Locked);
+}
+
+/// Items submitted in reverse order for release must be processed correctly.
+#[test]
+fn batch_release_reverse_order_input_releases_all_correctly() {
+    let ctx = TestCtx::new();
+    ctx.token_sac.mint(&ctx.depositor, &(AMOUNT * 3));
+
+    ctx.lock_one(10);
+    ctx.lock_one(20);
+    ctx.lock_one(30);
+
+    // Submit release items in reverse order
+    let mut items = Vec::new(&ctx.env);
+    items.push_back(ctx.release_item(30));
+    items.push_back(ctx.release_item(20));
+    items.push_back(ctx.release_item(10));
+
+    let count = ctx.client.batch_release_funds(&items);
+    assert_eq!(count, 3);
+
+    ctx.assert_escrow_status(10, EscrowStatus::Released);
+    ctx.assert_escrow_status(20, EscrowStatus::Released);
+    ctx.assert_escrow_status(30, EscrowStatus::Released);
 }

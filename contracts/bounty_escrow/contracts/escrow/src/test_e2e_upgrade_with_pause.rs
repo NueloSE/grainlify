@@ -512,10 +512,7 @@ fn test_emergency_withdraw_preserves_pause_state() {
     s.advance_time();
     s.unpause_all();
 
-    // Disable invariants as the contract was manually drained
-    s.env.as_contract(&s.escrow_id, || {
-        crate::invariants::set_disabled_for_test(&s.env, true);
-    });
+    // Keep invariants enabled; escrow fields remain consistent even after drain.
 
     s.advance_time();
     s.escrow_client

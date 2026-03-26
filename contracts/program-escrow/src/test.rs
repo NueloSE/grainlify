@@ -210,9 +210,16 @@ fn test_stress_high_load_many_payouts() {
     let env = Env::default();
     let (client, _admin, token_client, _token_admin) = setup_program(&env, 1_000_000);
 
-    for _ in 0..100 {
-        let recipient = Address::generate(&env);
-        client.single_payout(&recipient, &3_000);
+    for _ in 0..10 {
+        let mut recipients = vec![&env];
+        let mut amounts = vec![&env];
+
+        for _ in 0..10 {
+            recipients.push_back(Address::generate(&env));
+            amounts.push_back(3_000);
+        }
+
+        client.batch_payout(&recipients, &amounts);
     }
 
     let info = client.get_program_info();
@@ -745,16 +752,12 @@ fn test_batch_initialize_programs_success() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     items.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "prog-2"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     let count = client
         .try_batch_initialize_programs(&items)
@@ -788,16 +791,12 @@ fn test_batch_initialize_programs_duplicate_id_err() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     items.push_back(ProgramInitItem {
         program_id: pid,
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     let res = client.try_batch_initialize_programs(&items);
     assert!(matches!(res, Err(Ok(BatchError::DuplicateProgramId))));
@@ -838,8 +837,6 @@ fn test_batch_register_happy_path_five_programs() {
             authorized_payout_key: admin.clone(),
             token_address: token.clone(),
             reference_hash: None,
-            creator: admin.clone(),
-            initial_liquidity: None,
         });
     }
 
@@ -868,8 +865,6 @@ fn test_batch_register_single_item() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
 
     let count = client
@@ -895,8 +890,6 @@ fn test_batch_register_exceeds_max_batch_size() {
             authorized_payout_key: admin.clone(),
             token_address: token.clone(),
             reference_hash: None,
-            creator: admin.clone(),
-            initial_liquidity: None,
         });
     }
 
@@ -919,8 +912,6 @@ fn test_batch_register_at_exact_max_batch_size() {
             authorized_payout_key: admin.clone(),
             token_address: token.clone(),
             reference_hash: None,
-            creator: admin.clone(),
-            initial_liquidity: None,
         });
     }
 
@@ -951,8 +942,6 @@ fn test_batch_register_program_already_exists_error() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     client
         .try_batch_initialize_programs(&first)
@@ -966,16 +955,12 @@ fn test_batch_register_program_already_exists_error() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     second.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "existing"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
 
     let res = client.try_batch_initialize_programs(&second);
@@ -1000,24 +985,18 @@ fn test_batch_register_all_or_nothing_on_duplicate() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     items.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "beta"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     items.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "alpha"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
 
     let res = client.try_batch_initialize_programs(&items);
@@ -1042,24 +1021,18 @@ fn test_batch_register_duplicate_at_tail() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     items.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "dup-tail"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     items.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "dup-tail"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
 
     let res = client.try_batch_initialize_programs(&items);
@@ -1083,16 +1056,12 @@ fn test_batch_register_different_auth_keys_and_tokens() {
         authorized_payout_key: admin_a.clone(),
         token_address: token_a.clone(),
         reference_hash: None,
-        creator: admin_a.clone(),
-        initial_liquidity: None,
     });
     items.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "prog-b"),
         authorized_payout_key: admin_b.clone(),
         token_address: token_b.clone(),
         reference_hash: None,
-        creator: admin_b.clone(),
-        initial_liquidity: None,
     });
 
     let count = client
@@ -1120,24 +1089,18 @@ fn test_batch_register_events_emitted_per_program() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     items.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "evt-2"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     items.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "evt-3"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
 
     client
@@ -1171,16 +1134,12 @@ fn test_batch_register_sequential_batches_no_conflict() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     batch1.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "b1-b"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     let c1 = client
         .try_batch_initialize_programs(&batch1)
@@ -1195,16 +1154,12 @@ fn test_batch_register_sequential_batches_no_conflict() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     batch2.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "b2-b"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     let c2 = client
         .try_batch_initialize_programs(&batch2)
@@ -1234,8 +1189,6 @@ fn test_batch_register_second_batch_conflicts_with_first() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     client
         .try_batch_initialize_programs(&batch1)
@@ -1249,16 +1202,12 @@ fn test_batch_register_second_batch_conflicts_with_first() {
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
     batch2.push_back(ProgramInitItem {
         program_id: String::from_str(&env, "shared"),
         authorized_payout_key: admin.clone(),
         token_address: token.clone(),
         reference_hash: None,
-        creator: admin.clone(),
-        initial_liquidity: None,
     });
 
     let res = client.try_batch_initialize_programs(&batch2);
@@ -1296,8 +1245,6 @@ fn test_max_program_count_sequential_batches_queries_accurate() {
                 authorized_payout_key: admin.clone(),
                 token_address: token.clone(),
                 reference_hash: None,
-                creator: admin.clone(),
-                initial_liquidity: None,
             });
         }
         let count = client
@@ -2292,4 +2239,80 @@ fn test_release_schedules_persist_after_simulated_upgrade() {
     assert_eq!(stats_final.released_count, 2);
     assert_eq!(stats_final.scheduled_count, 0);
     assert_eq!(stats_final.remaining_balance, 100_000);
+}
+
+#[test]
+fn test_program_fee_zero_by_default_matches_prior_payouts() {
+    let env = Env::default();
+    let (client, _admin, token_client, _token_admin) = setup_program(&env, 100_000);
+    let recipient = Address::generate(&env);
+    let data = client.single_payout(&recipient, &30_000);
+    assert_eq!(data.remaining_balance, 70_000);
+    assert_eq!(token_client.balance(&recipient), 30_000);
+}
+
+#[test]
+fn test_program_payout_fee_percentage_and_fixed() {
+    let env = Env::default();
+    let (client, admin, token_client, token_admin) = setup_program(&env, 0);
+    let fee_bucket = Address::generate(&env);
+    token_admin.mint(&client.address, &100_000);
+    client.lock_program_funds(&100_000);
+    client.update_fee_config(
+        &None,
+        &Some(1_000i128),
+        &None,
+        &Some(500i128),
+        &Some(fee_bucket.clone()),
+        &Some(true),
+    );
+    let recipient = Address::generate(&env);
+    // Gross 10_000: 10% ceil = 1_000 + 500 fixed = 1_500 fee, net 8_500
+    client.single_payout(&recipient, &10_000);
+    assert_eq!(token_client.balance(&recipient), 8_500);
+    assert_eq!(token_client.balance(&fee_bucket), 1_500);
+    assert_eq!(client.get_remaining_balance(), 90_000);
+    let _ = admin;
+}
+
+#[test]
+fn test_program_lock_fixed_fee_reduces_credited_balance() {
+    let env = Env::default();
+    let (client, admin, token_client, token_admin) = setup_program(&env, 0);
+    let fee_bucket = Address::generate(&env);
+    token_admin.mint(&client.address, &50_000);
+    client.update_fee_config(
+        &None,
+        &None,
+        &Some(2_000i128),
+        &None,
+        &Some(fee_bucket.clone()),
+        &Some(true),
+    );
+    client.lock_program_funds(&20_000);
+    assert_eq!(client.get_remaining_balance(), 18_000);
+    assert_eq!(token_client.balance(&fee_bucket), 2_000);
+    let _ = admin;
+}
+
+#[test]
+fn test_program_update_fee_config_disables_fees() {
+    let env = Env::default();
+    let (client, admin, token_client, token_admin) = setup_program(&env, 0);
+    let fee_bucket = Address::generate(&env);
+    token_admin.mint(&client.address, &50_000);
+    client.update_fee_config(
+        &None,
+        &None,
+        &Some(1_000i128),
+        &None,
+        &Some(fee_bucket.clone()),
+        &Some(true),
+    );
+    client.lock_program_funds(&10_000);
+    client.update_fee_config(&None, &None, &None, &None, &None, &Some(false));
+    client.lock_program_funds(&10_000);
+    assert_eq!(client.get_remaining_balance(), 19_000);
+    assert_eq!(token_client.balance(&fee_bucket), 1_000);
+    let _ = admin;
 }
