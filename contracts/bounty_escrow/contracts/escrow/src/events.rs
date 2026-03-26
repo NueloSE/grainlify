@@ -166,10 +166,35 @@ pub fn emit_funds_released(env: &Env, event: FundsReleased) {
     env.events().publish(topics, event.clone());
 }
 
+// ── Refund trigger type ───────────────────────────────────────────────────────
+
+/// Discriminator indicating which code path triggered a refund.
+///
+/// Carried in [`FundsRefunded`] and [`RefundRecord`] so that indexers and
+/// auditors can distinguish between the three refund mechanisms without
+/// inspecting storage or transaction inputs.
+///
+/// | Variant | Trigger |
+/// |---------|---------|
+/// | `AdminApproval` | Admin called `approve_refund` then `refund` (existing dual-auth path). |
+/// | `DeadlineExpired` | `auto_refund` called permissionlessly after the deadline passed. |
+/// | `OracleAttestation` | Configured oracle called `oracle_refund` to attest a dispute outcome. |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RefundTriggerType {
+    /// Admin-approved refund (existing dual-auth behavior).
+    AdminApproval,
+    /// Time-based auto-refund after deadline (permissionless).
+    DeadlineExpired,
+    /// Oracle-attested refund (dispute resolved in favor of depositor).
+    OracleAttestation,
+}
+
 /// Payload for the [`emit_funds_refunded`] event.
 ///
-/// Emitted after a successful refund via [`BountyEscrowContract::refund`]
-/// or `refund_resolved` (anonymous escrow path).
+/// Emitted after a successful refund via [`BountyEscrowContract::refund`],
+/// `refund_resolved` (anonymous escrow path), `oracle_refund`, or
+/// `auto_refund`.
 ///
 /// ### Topics
 /// | Index | Value |
@@ -182,6 +207,8 @@ pub fn emit_funds_released(env: &Env, event: FundsReleased) {
 ///   approval overrides the recipient (e.g. custom partial-refund target).
 /// - For anonymous escrows the depositor identity is never revealed; only
 ///   the on-chain resolver-approved `recipient` is used.
+/// - `trigger_type` identifies which refund path was taken so downstream
+///   consumers can distinguish oracle-attested from time-based refunds.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct FundsRefunded {
@@ -190,11 +217,46 @@ pub struct FundsRefunded {
     pub amount: i128,
     pub refund_to: Address,
     pub timestamp: u64,
+    /// Which code path triggered this refund.
+    pub trigger_type: RefundTriggerType,
 }
 
 /// Emit [`FundsRefunded`].
 pub fn emit_funds_refunded(env: &Env, event: FundsRefunded) {
     let topics = (symbol_short!("f_ref"), event.bounty_id);
+    env.events().publish(topics, event.clone());
+}
+
+// ── Oracle config event ───────────────────────────────────────────────────────
+
+/// Payload for the [`emit_oracle_config_updated`] event.
+///
+/// Emitted when the admin configures or updates the oracle address via
+/// [`BountyEscrowContract::set_oracle`].
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"orc_cfg"` |
+///
+/// ### Security notes
+/// - Only the admin can call `set_oracle`; this event serves as an
+///   on-chain audit trail of oracle configuration changes.
+/// - When `enabled = false` the oracle address is stored but
+///   `oracle_refund` calls will be rejected until re-enabled.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OracleConfigUpdated {
+    pub version: u32,
+    pub oracle_address: Address,
+    pub enabled: bool,
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Emit [`OracleConfigUpdated`].
+pub fn emit_oracle_config_updated(env: &Env, event: OracleConfigUpdated) {
+    let topics = (symbol_short!("orc_cfg"),);
     env.events().publish(topics, event.clone());
 }
 
@@ -235,6 +297,7 @@ pub struct FeeCollected {
     pub operation_type: FeeOperationType, // determines if the fee was collected on lock or release.
     pub amount: i128,                     // actual fee amount transferred
     pub fee_rate: i128,                   // fee rate applied in basis points (1 bp = 0.01 %).
+    pub fee_fixed: i128,                  // flat fee component
     pub recipient: Address,
     pub timestamp: u64, // Ledger timestamp.
 }
@@ -291,6 +354,10 @@ pub struct FeeConfigUpdated {
     pub lock_fee_rate: i128,
     /// New release fee rate in basis points.
     pub release_fee_rate: i128,
+    /// New lock fixed fee.
+    pub lock_fixed_fee: i128,
+    /// New release fixed fee.
+    pub release_fixed_fee: i128,
     /// Address designated to receive fees.
     pub fee_recipient: Address,
     /// Whether fee collection is active after this update.
@@ -502,482 +569,4 @@ pub enum CriticalOperationOutcome {
 ///
 /// ### Security notes
 /// - This is **deterministic pseudo-randomness**, not cryptographically
-///   unpredictable.  Callers who control `external_seed` or ledger state
-///   can influence the result.  Use only for low-stakes selections.
-/// - `seed_hash` and `winner_score` are published on-chain so that the
-///   selection is publicly verifiable even if the inputs are private.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeterministicSelectionDerived {
-    /// Bounty for which a winner was selected.
-    pub bounty_id: u64,
-    /// Zero-based index into the `candidates` slice that was chosen.
-    pub selected_index: u32,
-    /// Total number of candidates considered.
-    pub candidate_count: u32,
-    /// Address that was selected as the winner.
-    pub selected_beneficiary: Address,
-    /// Hash of the combined seed material (for verification).
-    pub seed_hash: BytesN<32>,
-    /// Per-candidate score byte string that determined the winner.
-    pub winner_score: BytesN<32>,
-    /// Ledger timestamp.
-    pub timestamp: u64,
-}
-
-/// Emit [`DeterministicSelectionDerived`]
-pub fn emit_deterministic_selection(env: &Env, event: DeterministicSelectionDerived) {
-    let topics = (symbol_short!("prng_sel"), event.bounty_id);
-    env.events().publish(topics, event);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ANONYMOUS ESCROW EVENTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Payload for the [`emit_funds_locked_anon`] event.
-///
-/// Emitted by [`BountyEscrowContract::lock_funds_anonymous`].
-/// The depositor's address is **not** stored on-chain; only the 32-byte
-/// commitment is recorded.
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"f_lkanon"` |
-/// | 1 | `bounty_id: u64` |
-///
-/// ### Security notes
-/// - Commitment must be computed off-chain using a collision-resistant
-///   hash function.  The contract does not validate commitment format.
-/// - Refunds for anonymous escrows require the configured
-///   `AnonymousResolver` to call `refund_resolved`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FundsLockedAnon {
-    pub version: u32,
-    pub bounty_id: u64,
-    pub amount: i128,
-    pub depositor_commitment: BytesN<32>,
-    pub deadline: u64,
-}
-/// Emit [`FundsLockedAnon`]
-pub fn emit_funds_locked_anon(env: &Env, event: FundsLockedAnon) {
-    let topics = (symbol_short!("f_lkanon"), event.bounty_id);
-    env.events().publish(topics, event);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// OPERATIONAL STATE EVENTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Payload for the [`emit_deprecation_state_changed`] event.
-///
-/// Emitted when the admin activates or deactivates the contract kill-switch.
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"deprec"` |
-///
-/// ### Security notes
-/// - When `deprecated = true`, all `lock_funds` and `batch_lock_funds`
-///   calls will fail with `ContractDeprecated`.
-/// - Existing escrows continue to release or refund normally.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeprecationStateChanged {
-    pub deprecated: bool,
-    pub migration_target: Option<Address>, // optional address of the replacement contract for migration.
-    pub admin: Address,
-    /// admin address that triggered the change.
-    pub timestamp: u64,
-}
-
-/// Emit [`DeprecationStateChanged`].
-pub fn emit_deprecation_state_changed(env: &Env, event: DeprecationStateChanged) {
-    let topics = (symbol_short!("deprec"),);
-    env.events().publish(topics, event);
-}
-
-/// Payload for the [`emit_maintenance_mode_changed`] event.
-///
-/// Emitted when maintenance mode is toggled by the admin.
-/// When enabled, `lock_funds` returns `FundsPaused` (as if `lock_paused`
-/// were true).
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"maint"` |
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaintenanceModeChanged {
-    pub enabled: bool,
-    pub admin: Address,
-    pub timestamp: u64,
-}
-
-/// Emit [`MaintenanceModeChanged`]
-pub fn emit_maintenance_mode_changed(env: &Env, event: MaintenanceModeChanged) {
-    let topics = (symbol_short!("maint"),);
-    env.events().publish(topics, event);
-}
-
-/// Payload for the [`emit_participant_filter_mode_changed`] event.
-///
-/// Emitted when the admin changes the participant filter mode.
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"pf_mode"` |
-///
-/// ### Security notes
-/// - Transitioning modes does not clear list data; only the active mode
-///   is enforced on subsequent `lock_funds` calls.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ParticipantFilterModeChanged {
-    pub previous_mode: crate::ParticipantFilterMode,
-    pub new_mode: crate::ParticipantFilterMode,
-    pub admin: Address,
-    pub timestamp: u64,
-}
-
-/// Emit [`ParticipantFilterModeChanged`]
-pub fn emit_participant_filter_mode_changed(env: &Env, event: ParticipantFilterModeChanged) {
-    let topics = (symbol_short!("pf_mode"),);
-    env.events().publish(topics, event);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// RISK FLAG EVENTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Payload for the [`emit_risk_flags_updated`] event.
-///
-/// Emitted when an admin sets or clears risk flags on a bounty's metadata.
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"risk"` |
-/// | 1 | `bounty_id: u64` |
-///
-/// ### Defined risk flag bits
-/// | Bit | Constant | Meaning |
-/// |-----|----------|---------|
-/// | 0 | `RISK_FLAG_HIGH_RISK` | Elevated risk profile |
-/// | 1 | `RISK_FLAG_UNDER_REVIEW` | Under active review |
-/// | 2 | `RISK_FLAG_RESTRICTED` | Payout restricted pending investigation |
-/// | 3 | `RISK_FLAG_DEPRECATED` | Bounty marked deprecated |
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RiskFlagsUpdated {
-    pub version: u32,
-    pub bounty_id: u64,
-    pub previous_flags: u32,
-    pub new_flags: u32,
-    pub admin: Address,
-    pub timestamp: u64,
-}
-
-/// Emit [`RiskFlagsUpdated`]
-pub fn emit_risk_flags_updated(env: &Env, event: RiskFlagsUpdated) {
-    let topics = (symbol_short!("risk"), event.bounty_id);
-    env.events().publish(topics, event);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CLAIM TICKET EVENTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Payload for the [`emit_ticket_issued`] event.
-///
-/// Emitted when the admin issues a single-use claim ticket via
-/// [`BountyEscrowContract::issue_claim_ticket`].
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"ticket_i"` |
-/// | 1 | `ticket_id: u64` |
-///
-/// ### Security notes
-/// - Ticket IDs are monotonically increasing; gaps indicate revocations
-///   or failed issuance attempts (which do not emit this event).
-/// - The `beneficiary` field allows off-chain indexers to build a
-///   per-address ticket inbox without scanning all tickets.
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NotificationPreferencesUpdated {
-    pub version: u32,
-    pub bounty_id: u64,
-    pub previous_prefs: u32,
-    pub new_prefs: u32,
-    pub actor: Address,
-    pub created: bool,
-    pub timestamp: u64,
-}
-
-pub fn emit_notification_preferences_updated(env: &Env, event: NotificationPreferencesUpdated) {
-    let topics = (symbol_short!("npref"), event.bounty_id);
-    env.events().publish(topics, event);
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TicketIssued {
-    pub ticket_id: u64,
-    pub bounty_id: u64,
-    pub beneficiary: Address,
-    pub amount: i128,
-    pub expires_at: u64,
-    pub issued_at: u64,
-}
-
-/// Emit [`TicketIssued`]
-pub fn emit_ticket_issued(env: &Env, event: TicketIssued) {
-    let topics = (symbol_short!("ticket_i"), event.ticket_id);
-    env.events().publish(topics, event);
-}
-
-/// Payload for the [`emit_ticket_claimed`] event.
-///
-/// Emitted when a claim ticket is successfully redeemed.
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"ticket_c"` |
-/// | 1 | `ticket_id: u64` |
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TicketClaimed {
-    pub ticket_id: u64,
-    /// Ticket that was redeemed.
-    pub bounty_id: u64,
-    /// Bounty the ticket was issued against.
-    pub claimer: Address,
-    /// Address that redeemed the ticket.
-    pub claimed_at: u64,
-}
-
-/// Emit [`TicketClaimed`]
-pub fn emit_ticket_claimed(env: &Env, event: TicketClaimed) {
-    let topics = (symbol_short!("ticket_c"), event.ticket_id);
-    env.events().publish(topics, event);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PAUSE & EMERGENCY EVENTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Emit a pause-state-changed event for a single operation type.
-///
-/// This function is called for `lock`, `release`, and `refund` operations
-/// individually when [`BountyEscrowContract::set_paused`] is invoked.
-///
-/// ### Topics
-/// `("pause", operation_symbol)`
-pub fn emit_pause_state_changed(env: &Env, event: crate::PauseStateChanged) {
-    let topics = (symbol_short!("pause"), event.operation.clone());
-    env.events().publish(topics, event);
-}
-
-/// Payload for the [`emit_emergency_withdraw`] event.
-///
-/// Emitted when the admin drains all token balances from the contract via
-/// [`BountyEscrowContract::emergency_withdraw`].
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"em_wtd"` |
-///
-/// ### Security notes
-/// - This function can only be called when `lock_paused = true`,
-///   ensuring depositors have visible warning before a drain is possible.
-/// - The `amount` field reflects the **entire** contract balance at the
-///   time of withdrawal, which may cover multiple open escrows.
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EmergencyWithdrawEvent {
-    pub admin: Address,
-    pub recipient: Address,
-    pub amount: i128,
-    pub timestamp: u64,
-}
-
-/// Emit [`EmergencyWithdrawEvent`]
-pub fn emit_emergency_withdraw(env: &Env, event: EmergencyWithdrawEvent) {
-    let topics = (symbol_short!("em_wtd"),);
-    env.events().publish(topics, event.clone());
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CAPABILITY EVENTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Payload for the [`emit_capability_issued`] event.
-///
-/// Emitted when the admin or an authorized party creates a new capability
-/// token via [`BountyEscrowContract::issue_capability`].
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"cap_new"` |
-/// | 1 | `capability_id: u64` |
-///
-/// ### Security notes
-/// - Capabilities are scoped to a specific `(action, bounty_id,
-///   amount_limit)` triplet at issuance time.
-/// - An owner cannot issue a capability whose `amount_limit` exceeds
-///   their own authority over the referenced escrow.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CapabilityIssued {
-    /// Unique monotonic capability identifier.
-    pub capability_id: u64,
-    /// Address that created and vouches for this capability.
-    pub owner: Address,
-    /// Address authorised to exercise this capability.
-    pub holder: Address,
-    /// Permitted action (`Claim`, `Release`, or `Refund`).
-    pub action: CapabilityAction,
-    /// Bounty this capability is scoped to.
-    pub bounty_id: u64,
-    /// Maximum token amount the holder may exercise in total.
-    pub amount_limit: i128,
-    /// Unix timestamp past which the capability is invalid.
-    pub expires_at: u64,
-    /// Maximum number of times the holder may exercise this capability.
-    pub max_uses: u32,
-    /// Ledger timestamp of issuance.
-    pub timestamp: u64,
-}
-
-/// Emit [`CapabilityIssued`]
-pub fn emit_capability_issued(env: &Env, event: CapabilityIssued) {
-    let topics = (symbol_short!("cap_new"), event.capability_id);
-    env.events().publish(topics, event);
-}
-
-/// Payload for the [`emit_capability_used`] event.
-///
-/// Emitted each time a capability is partially or fully consumed.
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"cap_use"` |
-/// | 1 | `capability_id: u64` |
-///
-/// ### Security notes
-/// - `remaining_amount` and `remaining_uses` after this event reflect
-///   the persisted on-chain values.
-/// - When both reach zero, the capability is effectively exhausted;
-///   subsequent calls will return `CapabilityUsesExhausted` or
-///   `CapabilityAmountExceeded`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CapabilityUsed {
-    /// Capability that was exercised.
-    pub capability_id: u64,
-    /// Address that exercised the capability.
-    pub holder: Address,
-    /// Action that was performed.
-    pub action: CapabilityAction,
-    /// Bounty the action was applied to.
-    pub bounty_id: u64,
-    /// Token amount consumed in this exercise.
-    pub amount_used: i128,
-    /// Remaining token allowance after this exercise.
-    pub remaining_amount: i128,
-    /// Remaining use count after this exercise.
-    pub remaining_uses: u32,
-    /// Ledger timestamp.
-    pub used_at: u64,
-}
-
-/// Emit [`CapabilityUsed`]
-pub fn emit_capability_used(env: &Env, event: CapabilityUsed) {
-    let topics = (symbol_short!("cap_use"), event.capability_id);
-    env.events().publish(topics, event);
-}
-
-/// Payload for the [`emit_capability_revoked`] event.
-///
-/// Emitted when the owner revokes a previously issued capability.
-///
-/// ### Topics
-/// | Index | Value |
-/// |-------|-------|
-/// | 0 | `"cap_rev"` |
-/// | 1 | `capability_id: u64` |
-///
-/// ### Security notes
-/// - Revocation is permanent and idempotent.  A revoked capability cannot
-///   be re-enabled.
-/// - After revocation, any attempt by the holder to exercise the
-///   capability will fail with `CapabilityRevoked`
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CapabilityRevoked {
-    /// Capability that was revoked
-    pub capability_id: u64,
-    pub owner: Address,
-    pub revoked_at: u64,
-}
-
-/// Emit [`CapabilityRevoked`]
-pub fn emit_capability_revoked(env: &Env, event: CapabilityRevoked) {
-    let topics = (symbol_short!("cap_rev"), event.capability_id);
-    env.events().publish(topics, event);
-}
-
-/// Emitted when an operation's measured resource usage approaches the
-/// configured cap (at or above `WARNING_THRESHOLD_BPS / 10_000` of the cap).
-/// Only emitted in test / testutils builds; see `gas_budget` module docs.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GasBudgetCapApproached {
-    /// Canonical operation symbol (e.g. `symbol_short!("lock")`).
-    pub operation: Symbol,
-    /// Measured CPU instructions consumed by this call.
-    pub cpu_used: u64,
-    /// Measured memory bytes consumed by this call.
-    pub mem_used: u64,
-    /// Configured CPU instruction cap (`0` = uncapped).
-    pub cpu_cap: u64,
-    /// Configured memory byte cap (`0` = uncapped).
-    pub mem_cap: u64,
-    /// The warning threshold that was crossed, in basis points.
-    pub threshold_bps: u32,
-    /// Ledger timestamp at the time of the check.
-    pub timestamp: u64,
-}
-
-/// Emitted when an operation's measured resource usage exceeds the configured
-/// cap. When `GasBudgetConfig::enforce` is `true` this accompanies a
-/// transaction revert. Only emitted in test / testutils builds.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GasBudgetCapExceeded {
-    /// Canonical operation symbol (e.g. `symbol_short!("lock")`).
-    pub operation: Symbol,
-    /// Measured CPU instructions consumed by this call.
-    pub cpu_used: u64,
-    /// Measured memory bytes consumed by this call.
-    pub mem_used: u64,
-    /// Configured CPU instruction cap (`0` = uncapped).
-    pub cpu_cap: u64,
-    /// Configured memory byte cap (`0` = uncapped).
-    pub mem_cap: u64,
-    /// Ledger timestamp at the time of the check.
-    pub timestamp: u64,
-}
+///   unpredictable.  Callers who co
