@@ -3,7 +3,8 @@
 //! Parity with main contracts/bounty_escrow where applicable; see soroban/PARITY.md.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    String, Vec,
 };
 
 mod identity;
@@ -53,6 +54,7 @@ pub struct Escrow {
     pub status: EscrowStatus,
     pub deadline: u64,
     pub jurisdiction: OptionalJurisdiction,
+    pub labels: Vec<String>, // Issue #754/#789 (in progress)
 }
 
 #[contracttype]
@@ -511,6 +513,7 @@ impl EscrowContract {
             status: EscrowStatus::Locked,
             deadline,
             jurisdiction: jurisdiction.clone(),
+            labels: Vec::new(&env), // Issue #754/#789 (in progress)
         };
         env.storage()
             .persistent()
@@ -554,7 +557,7 @@ impl EscrowContract {
                 version: 1,
                 bounty_id,
                 actor: depositor,
-                labels,
+                labels: Vec::new(&env), // Issue #754/#789 (in progress)
                 timestamp: env.ledger().timestamp(),
             },
         );
@@ -923,5 +926,65 @@ pub mod traits {
     }
 }
 
+// ── Temporary stubs to fix build for Issue #397 ─────────────────────────────
+// Full implementations tracked in issues #754 (labels) and #789 (search/count).
+
+const MAX_LABELS: u32 = 10;
+const MAX_LABEL_LENGTH: u32 = 32;
+const MAX_PAGE_SIZE: u32 = 20;
+
+const ESCROW_LABELS_UPDATED: soroban_sdk::Symbol = symbol_short!("esc_lbl");
+const LABEL_CONFIG_UPDATED: soroban_sdk::Symbol = symbol_short!("lbl_cfg");
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LabelConfig {
+    pub restricted: bool,
+    pub allowed_labels: Vec<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowLabelsUpdatedEvent {
+    pub version: u32,
+    pub bounty_id: u64,
+    pub actor: Address,
+    pub labels: Vec<String>,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct LabelConfigUpdatedEvent {
+    pub version: u32,
+    pub admin: Address,
+    pub restricted: bool,
+    pub allowed_labels: Vec<String>,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowLabelRecord {
+    pub bounty_id: u64,
+    pub depositor: Address,
+    pub amount: i128,
+    pub remaining_amount: i128,
+    pub status: EscrowStatus,
+    pub deadline: u64,
+    pub labels: Vec<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowLabelPage {
+    pub records: Vec<EscrowLabelRecord>,
+    pub next_cursor: Option<u64>,
+    pub has_more: bool,
+}
+
+// ── End of temporary stubs ───────────────────────────────────────────────────
+
 mod identity_test;
 mod test;
+mod test_max_counts;
