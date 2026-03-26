@@ -246,6 +246,7 @@ mod monitoring {
 
         let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
         let total: u64 = env.storage().persistent().get(&time_key).unwrap_or(0);
+        let timestamp = env.ledger().timestamp();
 
         env.storage().persistent().set(&count_key, &(count + 1));
         env.storage()
@@ -260,7 +261,7 @@ mod monitoring {
             PerformanceMetric {
                 function,
                 duration,
-                timestamp: env.ledger().timestamp(),
+                timestamp,
             },
         );
     }
