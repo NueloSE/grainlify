@@ -15,6 +15,8 @@ mod test_deterministic_randomness;
 #[cfg(test)]
 mod test_multi_token_fees;
 #[cfg(test)]
+mod test_multi_region_treasury;
+#[cfg(test)]
 mod test_rbac;
 #[cfg(test)]
 mod test_risk_flags;
@@ -813,11 +815,36 @@ pub struct AntiAbuseConfigView {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Treasury routing destination used for weighted multi-region fee distribution.
+///
+/// The `weight` field is interpreted relative to the sum of all configured
+/// destination weights. Fee routing is deterministic: each destination receives
+/// a proportional share and any rounding remainder is assigned to the final
+/// destination in the configured order so accounting remains exact.
+pub struct TreasuryDestination {
+    /// Treasury wallet that receives routed fees.
+    pub address: Address,
+    /// Relative routing weight. Must be greater than zero when configured.
+    pub weight: u32,
+    /// Human-readable treasury region or routing label.
+    pub region: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeConfig {
+    /// Fee rate charged when funds are locked, expressed in basis points.
     pub lock_fee_rate: i128,
+    /// Fee rate charged when funds are released, expressed in basis points.
     pub release_fee_rate: i128,
+    /// Default fallback recipient when multi-region routing is disabled.
     pub fee_recipient: Address,
+    /// Whether fee collection is enabled.
     pub fee_enabled: bool,
+    /// Weighted treasury destinations used for multi-region routing.
+    pub treasury_destinations: Vec<TreasuryDestination>,
+    /// Whether multi-region treasury routing is enabled.
+    pub distribution_enabled: bool,
 }
 
 /// Per-token fee configuration.
@@ -1150,7 +1177,140 @@ impl BountyEscrowContract {
                 release_fee_rate: 0,
                 fee_recipient: env.storage().instance().get(&DataKey::Admin).unwrap(),
                 fee_enabled: false,
+                treasury_destinations: Vec::new(env),
+                distribution_enabled: false,
             })
+    }
+
+    /// Validates treasury destinations before enabling multi-region routing.
+    fn validate_treasury_destinations(
+        _env: &Env,
+        destinations: &Vec<TreasuryDestination>,
+        distribution_enabled: bool,
+    ) -> Result<(), Error> {
+        if !distribution_enabled {
+            return Ok(());
+        }
+
+        if destinations.is_empty() {
+            return Err(Error::InvalidAmount);
+        }
+
+        let mut total_weight: u64 = 0;
+        for destination in destinations.iter() {
+            if destination.weight == 0 {
+                return Err(Error::InvalidAmount);
+            }
+
+            if destination.region.is_empty() || destination.region.len() > 50 {
+                return Err(Error::InvalidAmount);
+            }
+
+            total_weight = total_weight
+                .checked_add(destination.weight as u64)
+                .ok_or(Error::InvalidAmount)?;
+        }
+
+        if total_weight == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        Ok(())
+    }
+
+    /// Routes a collected fee to either the default recipient or configured treasury splits.
+    fn route_fee(
+        env: &Env,
+        client: &token::Client,
+        config: &FeeConfig,
+        fee_amount: i128,
+        fee_rate: i128,
+        operation_type: events::FeeOperationType,
+    ) -> Result<(), Error> {
+        if fee_amount <= 0 {
+            return Ok(());
+        }
+
+        if !config.distribution_enabled || config.treasury_destinations.is_empty() {
+            client.transfer(
+                &env.current_contract_address(),
+                &config.fee_recipient,
+                &fee_amount,
+            );
+            events::emit_fee_collected(
+                env,
+                events::FeeCollected {
+                    operation_type,
+                    amount: fee_amount,
+                    fee_rate,
+                    recipient: config.fee_recipient.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            return Ok(());
+        }
+
+        let mut total_weight: u64 = 0;
+        for destination in config.treasury_destinations.iter() {
+            total_weight = total_weight
+                .checked_add(destination.weight as u64)
+                .ok_or(Error::InvalidAmount)?;
+        }
+
+        if total_weight == 0 {
+            client.transfer(
+                &env.current_contract_address(),
+                &config.fee_recipient,
+                &fee_amount,
+            );
+            events::emit_fee_collected(
+                env,
+                events::FeeCollected {
+                    operation_type,
+                    amount: fee_amount,
+                    fee_rate,
+                    recipient: config.fee_recipient.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            return Ok(());
+        }
+
+        let mut distributed = 0i128;
+        let destination_count = config.treasury_destinations.len() as usize;
+
+        for (index, destination) in config.treasury_destinations.iter().enumerate() {
+            let share = if index + 1 == destination_count {
+                fee_amount.checked_sub(distributed).ok_or(Error::InvalidAmount)?
+            } else {
+                fee_amount
+                    .checked_mul(destination.weight as i128)
+                    .and_then(|value| value.checked_div(total_weight as i128))
+                    .ok_or(Error::InvalidAmount)?
+            };
+
+            distributed = distributed
+                .checked_add(share)
+                .ok_or(Error::InvalidAmount)?;
+
+            if share <= 0 {
+                continue;
+            }
+
+            client.transfer(&env.current_contract_address(), &destination.address, &share);
+            events::emit_fee_collected(
+                env,
+                events::FeeCollected {
+                    operation_type: operation_type.clone(),
+                    amount: share,
+                    fee_rate,
+                    recipient: destination.address,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+        }
+
+        Ok(())
     }
 
     /// Update fee configuration (admin only)
@@ -1208,6 +1368,46 @@ impl BountyEscrowContract {
         );
 
         Ok(())
+    }
+
+    /// Configures weighted treasury destinations for multi-region fee routing.
+    ///
+    /// When enabled, collected lock and release fees are routed proportionally
+    /// across `destinations` instead of sending the full amount to
+    /// `fee_recipient`. Disabled routing preserves the configured destinations
+    /// but falls back to the single-recipient path until re-enabled.
+    pub fn set_treasury_distributions(
+        env: Env,
+        destinations: Vec<TreasuryDestination>,
+        distribution_enabled: bool,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        Self::validate_treasury_destinations(&env, &destinations, distribution_enabled)?;
+
+        let mut fee_config = Self::get_fee_config_internal(&env);
+        fee_config.treasury_destinations = destinations;
+        fee_config.distribution_enabled = distribution_enabled;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, &fee_config);
+
+        Ok(())
+    }
+
+    /// Returns the current treasury routing configuration.
+    pub fn get_treasury_distributions(env: Env) -> (Vec<TreasuryDestination>, bool) {
+        let fee_config = Self::get_fee_config_internal(&env);
+        (
+            fee_config.treasury_destinations,
+            fee_config.distribution_enabled,
+        )
     }
 
     /// Updates the granular pause state and metadata for the contract.
@@ -1959,27 +2159,24 @@ impl BountyEscrowContract {
     /// Internal: resolve the effective fee config for the escrow token.
     ///
     /// Precedence: `TokenFeeConfig(token)` > global `FeeConfig`.
-    fn resolve_fee_config(env: &Env) -> (i128, i128, Address, bool) {
+    fn resolve_fee_config(env: &Env) -> FeeConfig {
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         if let Some(tok_cfg) = env
             .storage()
             .instance()
             .get::<DataKey, TokenFeeConfig>(&DataKey::TokenFeeConfig(token_addr))
         {
-            (
-                tok_cfg.lock_fee_rate,
-                tok_cfg.release_fee_rate,
-                tok_cfg.fee_recipient,
-                tok_cfg.fee_enabled,
-            )
-        } else {
             let global = Self::get_fee_config_internal(env);
-            (
-                global.lock_fee_rate,
-                global.release_fee_rate,
-                global.fee_recipient,
-                global.fee_enabled,
-            )
+            FeeConfig {
+                lock_fee_rate: tok_cfg.lock_fee_rate,
+                release_fee_rate: tok_cfg.release_fee_rate,
+                fee_recipient: tok_cfg.fee_recipient,
+                fee_enabled: tok_cfg.fee_enabled,
+                treasury_destinations: global.treasury_destinations,
+                distribution_enabled: global.distribution_enabled,
+            }
+        } else {
+            Self::get_fee_config_internal(env)
         }
     }
 
@@ -2188,14 +2385,13 @@ impl BountyEscrowContract {
         soroban_sdk::log!(&env, "transfer ok");
 
         // Resolve effective fee config (per-token takes precedence over global).
-        let (lock_fee_rate, _release_fee_rate, fee_recipient, fee_enabled) =
-            Self::resolve_fee_config(&env);
+        let fee_config = Self::resolve_fee_config(&env);
 
         // Deduct lock fee from the escrowed principal.
         // Ceiling division ensures fee >= 1 stroop whenever rate > 0,
         // preventing principal drain via dust-amount splitting.
-        let fee_amount = if fee_enabled && lock_fee_rate > 0 {
-            Self::calculate_fee(amount, lock_fee_rate)
+        let fee_amount = if fee_config.fee_enabled && fee_config.lock_fee_rate > 0 {
+            Self::calculate_fee(amount, fee_config.lock_fee_rate)
         } else {
             0
         };
@@ -2210,17 +2406,14 @@ impl BountyEscrowContract {
         // Transfer fee to recipient immediately (separate transfer so it is
         // visible as a distinct on-chain operation).
         if fee_amount > 0 {
-            client.transfer(&env.current_contract_address(), &fee_recipient, &fee_amount);
-            events::emit_fee_collected(
+            Self::route_fee(
                 &env,
-                events::FeeCollected {
-                    operation_type: events::FeeOperationType::Lock,
-                    amount: fee_amount,
-                    fee_rate: lock_fee_rate,
-                    recipient: fee_recipient,
-                    timestamp: env.ledger().timestamp(),
-                },
-            );
+                &client,
+                &fee_config,
+                fee_amount,
+                fee_config.lock_fee_rate,
+                events::FeeOperationType::Lock,
+            )?;
         }
         soroban_sdk::log!(&env, "fee ok");
 
@@ -2372,10 +2565,9 @@ impl BountyEscrowContract {
             return Err(Error::InsufficientFunds);
         }
         // 8. Fee computation (pure)
-        let (lock_fee_rate, _release_fee_rate, _fee_recipient, fee_enabled) =
-            Self::resolve_fee_config(env);
-        let fee_amount = if fee_enabled && lock_fee_rate > 0 {
-            Self::calculate_fee(amount, lock_fee_rate)
+        let fee_config = Self::resolve_fee_config(env);
+        let fee_amount = if fee_config.fee_enabled && fee_config.lock_fee_rate > 0 {
+            Self::calculate_fee(amount, fee_config.lock_fee_rate)
         } else {
             0
         };
@@ -2575,11 +2767,10 @@ impl BountyEscrowContract {
         let client = token::Client::new(&env, &token_addr);
 
         // Resolve effective fee config for release.
-        let (_lock_fee_rate, release_fee_rate, fee_recipient, fee_enabled) =
-            Self::resolve_fee_config(&env);
+        let fee_config = Self::resolve_fee_config(&env);
 
-        let release_fee = if fee_enabled && release_fee_rate > 0 {
-            Self::calculate_fee(escrow.amount, release_fee_rate)
+        let release_fee = if fee_config.fee_enabled && fee_config.release_fee_rate > 0 {
+            Self::calculate_fee(escrow.amount, fee_config.release_fee_rate)
         } else {
             0
         };
@@ -2594,21 +2785,14 @@ impl BountyEscrowContract {
         }
 
         if release_fee > 0 {
-            client.transfer(
-                &env.current_contract_address(),
-                &fee_recipient,
-                &release_fee,
-            );
-            events::emit_fee_collected(
+            Self::route_fee(
                 &env,
-                events::FeeCollected {
-                    operation_type: events::FeeOperationType::Release,
-                    amount: release_fee,
-                    fee_rate: release_fee_rate,
-                    recipient: fee_recipient,
-                    timestamp: env.ledger().timestamp(),
-                },
-            );
+                &client,
+                &fee_config,
+                release_fee,
+                fee_config.release_fee_rate,
+                events::FeeOperationType::Release,
+            )?;
         }
 
         // Transfer net amount to contributor
@@ -2694,10 +2878,9 @@ impl BountyEscrowContract {
         if escrow.status != EscrowStatus::Locked {
             return Err(Error::FundsNotLocked);
         }
-        let (_lock_fee_rate, release_fee_rate, _fee_recipient, fee_enabled) =
-            Self::resolve_fee_config(env);
-        let release_fee = if fee_enabled && release_fee_rate > 0 {
-            Self::calculate_fee(escrow.amount, release_fee_rate)
+        let fee_config = Self::resolve_fee_config(env);
+        let release_fee = if fee_config.fee_enabled && fee_config.release_fee_rate > 0 {
+            Self::calculate_fee(escrow.amount, fee_config.release_fee_rate)
         } else {
             0
         };

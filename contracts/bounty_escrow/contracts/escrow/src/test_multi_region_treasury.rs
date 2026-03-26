@@ -20,9 +20,7 @@
 
 #[cfg(test)]
 mod test_multi_region_treasury {
-    use crate::{
-        BountyEscrowContract, BountyEscrowContractClient, FeeConfig, TreasuryDestination,
-    };
+    use crate::{BountyEscrowContract, BountyEscrowContractClient, TreasuryDestination};
     use soroban_sdk::{testutils::Address as _, token, Address, Env, String, Vec};
 
     // ─── Helpers ────────────────────────────────────────────────────────────
@@ -47,23 +45,6 @@ mod test_multi_region_treasury {
         let client = BountyEscrowContractClient::new(env, &id);
         client.init(admin, token);
         client
-    }
-
-    fn create_treasury_destinations<'a>(
-        env: &'a Env,
-        regions: Vec<(&str, &str, u32)>,
-    ) -> Vec<TreasuryDestination> {
-        let mut destinations = Vec::new(env);
-        for (addr, region, weight) in regions {
-            let address = Address::from_string(&String::from_str(env, addr));
-            let region_str = String::from_str(env, region);
-            destinations.push_back(TreasuryDestination {
-                address,
-                weight,
-                region: region_str,
-            });
-        }
-        destinations
     }
 
     // ─── 1. Treasury destinations configuration tests ───────────────────────

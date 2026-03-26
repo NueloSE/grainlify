@@ -162,6 +162,8 @@ fn serialization_compatibility_public_types_and_events() {
                 release_fee_rate: 200,
                 fee_recipient: fee_recipient.clone(),
                 fee_enabled: true,
+                treasury_destinations: soroban_sdk::vec![&env],
+                distribution_enabled: false,
             }
             .into_val(&env),
         ),

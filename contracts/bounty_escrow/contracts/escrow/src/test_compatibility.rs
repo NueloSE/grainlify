@@ -161,6 +161,8 @@ fn test_optional_parameters_backward_compatible() {
     let config = client.get_fee_config();
     assert_eq!(config.lock_fee_rate, 0);
     assert_eq!(config.release_fee_rate, 0);
+    assert!(!config.distribution_enabled);
+    assert_eq!(config.treasury_destinations.len(), 0);
 }
 
 /// Test that new features don't break existing workflows
