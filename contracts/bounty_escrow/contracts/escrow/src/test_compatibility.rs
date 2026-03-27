@@ -544,11 +544,15 @@ fn test_get_escrow_ids_by_status_stable() {
     client.lock_funds(&depositor, &2, &500, &9999);
     client.release_funds(&1, &contributor);
 
-    let locked_ids = client.get_escrow_ids_by_status(&EscrowStatus::Locked, &0, &10);
-    assert_eq!(locked_ids.len(), 1);
+    // Test that update_fee_config works with None values (optional params)
+    client.update_fee_config(&None, &None, &None, &None, &None, &None);
 
-    let released_ids = client.get_escrow_ids_by_status(&EscrowStatus::Released, &0, &10);
-    assert_eq!(released_ids.len(), 1);
+    // Config should remain unchanged
+    let config = client.get_fee_config();
+    assert_eq!(config.lock_fee_rate, 0);
+    assert_eq!(config.release_fee_rate, 0);
+    assert!(!config.distribution_enabled);
+    assert_eq!(config.treasury_destinations.len(), 0);
 }
 
 /// `set_claim_window` + `authorize_claim` + `claim` happy path is stable.

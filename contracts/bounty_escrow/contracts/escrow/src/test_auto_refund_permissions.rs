@@ -59,6 +59,32 @@ impl<'a> TestSetup<'a> {
 }
 
 #[test]
+fn test_auto_refund_anyone_can_trigger_after_deadline() {
+    let setup = TestSetup::new();
+    let bounty_id = 1;
+    let amount = 1000;
+    let deadline = setup.env.ledger().timestamp() + 1000;
+
+    setup
+        .escrow
+        .lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    setup.env.ledger().set_timestamp(deadline + 1);
+
+    let initial_balance = setup.token.balance(&setup.depositor);
+
+    // Random user triggers refund
+    setup.escrow.refund(&bounty_id);
+
+    let escrow = setup.escrow.get_escrow_info(&bounty_id);
+    assert_eq!(escrow.status, EscrowStatus::Refunded);
+    assert_eq!(
+        setup.token.balance(&setup.depositor),
+        initial_balance + amount
+    );
+}
+
+#[test]
 fn test_auto_refund_admin_can_trigger_after_deadline() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -71,13 +97,7 @@ fn test_auto_refund_admin_can_trigger_after_deadline() {
             invoke: &MockAuthInvoke {
                 contract: &setup.escrow.address,
                 fn_name: "lock_funds",
-                args: (
-                    setup.depositor.clone(),
-                    bounty_id,
-                    amount,
-                    deadline,
-                )
-                    .into_val(&setup.env),
+                args: (setup.depositor.clone(), bounty_id, amount, deadline).into_val(&setup.env),
                 sub_invokes: &[MockAuthInvoke {
                     contract: &setup.token.address,
                     fn_name: "transfer",
@@ -110,34 +130,36 @@ fn test_auto_refund_admin_can_trigger_after_deadline() {
 
     let initial_balance = setup.token.balance(&setup.depositor);
 
-    setup.env.mock_auths(&[MockAuth {
-        address: &setup.admin,
-        invoke: &MockAuthInvoke {
-            contract: &setup.escrow.address,
-            fn_name: "refund",
-            args: (bounty_id,).into_val(&setup.env),
-            sub_invokes: &[MockAuthInvoke {
-                contract: &setup.token.address,
-                fn_name: "transfer",
-                args: (
-                    setup.escrow.address.clone(),
-                    setup.depositor.clone(),
-                    amount,
-                )
-                    .into_val(&setup.env),
+    setup.env.mock_auths(&[
+        MockAuth {
+            address: &setup.admin,
+            invoke: &MockAuthInvoke {
+                contract: &setup.escrow.address,
+                fn_name: "refund",
+                args: (bounty_id,).into_val(&setup.env),
+                sub_invokes: &[MockAuthInvoke {
+                    contract: &setup.token.address,
+                    fn_name: "transfer",
+                    args: (
+                        setup.escrow.address.clone(),
+                        setup.depositor.clone(),
+                        amount,
+                    )
+                        .into_val(&setup.env),
+                    sub_invokes: &[],
+                }],
+            },
+        },
+        MockAuth {
+            address: &setup.depositor,
+            invoke: &MockAuthInvoke {
+                contract: &setup.escrow.address,
+                fn_name: "refund",
+                args: (bounty_id,).into_val(&setup.env),
                 sub_invokes: &[],
-            }],
+            },
         },
-    },
-    MockAuth {
-        address: &setup.depositor,
-        invoke: &MockAuthInvoke {
-            contract: &setup.escrow.address,
-            fn_name: "refund",
-            args: (bounty_id,).into_val(&setup.env),
-            sub_invokes: &[],
-        },
-    }]);
+    ]);
 
     // Admin triggers refund
     setup.escrow.refund(&bounty_id);
@@ -165,34 +187,36 @@ fn test_auto_refund_depositor_can_trigger_after_deadline() {
 
     let initial_balance = setup.token.balance(&setup.depositor);
 
-    setup.env.mock_auths(&[MockAuth {
-        address: &setup.depositor,
-        invoke: &MockAuthInvoke {
-            contract: &setup.escrow.address,
-            fn_name: "refund",
-            args: (bounty_id,).into_val(&setup.env),
-            sub_invokes: &[MockAuthInvoke {
-                contract: &setup.token.address,
-                fn_name: "transfer",
-                args: (
-                    setup.escrow.address.clone(),
-                    setup.depositor.clone(),
-                    amount,
-                )
-                    .into_val(&setup.env),
+    setup.env.mock_auths(&[
+        MockAuth {
+            address: &setup.depositor,
+            invoke: &MockAuthInvoke {
+                contract: &setup.escrow.address,
+                fn_name: "refund",
+                args: (bounty_id,).into_val(&setup.env),
+                sub_invokes: &[MockAuthInvoke {
+                    contract: &setup.token.address,
+                    fn_name: "transfer",
+                    args: (
+                        setup.escrow.address.clone(),
+                        setup.depositor.clone(),
+                        amount,
+                    )
+                        .into_val(&setup.env),
+                    sub_invokes: &[],
+                }],
+            },
+        },
+        MockAuth {
+            address: &setup.admin,
+            invoke: &MockAuthInvoke {
+                contract: &setup.escrow.address,
+                fn_name: "refund",
+                args: (bounty_id,).into_val(&setup.env),
                 sub_invokes: &[],
-            }],
+            },
         },
-    },
-    MockAuth {
-        address: &setup.admin,
-        invoke: &MockAuthInvoke {
-            contract: &setup.escrow.address,
-            fn_name: "refund",
-            args: (bounty_id,).into_val(&setup.env),
-            sub_invokes: &[],
-        },
-    }]);
+    ]);
 
     // Depositor triggers refund
     setup.escrow.refund(&bounty_id);

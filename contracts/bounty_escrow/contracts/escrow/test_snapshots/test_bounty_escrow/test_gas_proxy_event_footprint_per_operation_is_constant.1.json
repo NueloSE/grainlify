@@ -1265,7 +1265,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "u64": 21
+                  "u64": 20
                 }
               }
             },
@@ -3683,6 +3683,18 @@
                         },
                         "val": {
                           "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Version"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
                         }
                       }
                     ]

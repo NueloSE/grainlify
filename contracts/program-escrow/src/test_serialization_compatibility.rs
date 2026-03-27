@@ -86,6 +86,8 @@ fn serialization_compatibility_public_types_and_events() {
         initial_liquidity: 500,
         risk_flags: 0,
         reference_hash: None,
+        archived: false,
+        archived_at: None,
     };
 
     let program_initialized = ProgramInitializedEvent {

@@ -106,4 +106,3 @@ pub fn transfer_exact(
         Err(AssetIdError::TransferAmountMismatch)
     }
 }
-

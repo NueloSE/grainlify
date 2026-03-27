@@ -445,6 +445,7 @@ fn test_claim_cancellation_restores_refund_eligibility() {
     assert_eq!(setup.token.balance(&setup.depositor), 10_000_000);
 }
 
+/// After the bounty deadline, a pending claim still blocks refund until explicitly resolved.
 #[test]
 fn test_expiry_does_not_bypass_active_dispute() {
     let s = TestSetup::new();
@@ -461,9 +462,37 @@ fn test_expiry_does_not_bypass_active_dispute() {
 
     s.env.ledger().set_timestamp(deadline + 1);
 
-    let escrow_info = s.escrow.get_escrow_info(&bounty_id);
+    let res = s.escrow.try_refund(&bounty_id);
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err().unwrap(), Error::ClaimPending);
 
-    let _ = escrow_info;
+    let escrow_info = s.escrow.get_escrow_info(&bounty_id);
+    assert_eq!(escrow_info.status, EscrowStatus::Locked);
+    assert_eq!(s.token.balance(&s.escrow.address), amount);
+}
+
+/// No second payout path: once released to contributor, refund must fail.
+#[test]
+fn test_no_refund_after_successful_release() {
+    let s = TestSetup::new();
+    let bounty_id = 107u64;
+    let amount = 800i128;
+    let now = s.env.ledger().timestamp();
+    let deadline = now + 2_000;
+
+    s.escrow
+        .lock_funds(&s.depositor, &bounty_id, &amount, &deadline);
+    s.escrow.release_funds(&bounty_id, &s.contributor);
+
+    assert_eq!(
+        s.escrow.get_escrow_info(&bounty_id).status,
+        EscrowStatus::Released
+    );
+
+    s.env.ledger().set_timestamp(deadline + 1);
+    let res = s.escrow.try_refund(&bounty_id);
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err().unwrap(), Error::FundsNotLocked);
 }
 
 // Dispute opened before deadline → admin cancels claim → refund after deadline.

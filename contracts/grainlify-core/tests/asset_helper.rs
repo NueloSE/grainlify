@@ -2,9 +2,7 @@ use grainlify_core::asset::{
     balance, normalize_asset_id, transfer_exact, validate_asset_id, AssetIdError,
 };
 use soroban_sdk::{
-    contract, contractimpl, contracttype,
-    testutils::Address as _,
-    token, Address, Env,
+    contract, contractimpl, contracttype, testutils::Address as _, token, Address, Env,
 };
 
 #[contracttype]
@@ -123,7 +121,10 @@ fn transfer_exact_accepts_standard_sac_transfers() {
 
     admin_client.mint(&sender, &1_000);
 
-    assert_eq!(transfer_exact(&env, &token_address, &sender, &recipient, 250), Ok(()));
+    assert_eq!(
+        transfer_exact(&env, &token_address, &sender, &recipient, 250),
+        Ok(())
+    );
     assert_eq!(balance(&env, &token_address, &sender), Ok(750));
     assert_eq!(balance(&env, &token_address, &recipient), Ok(250));
 }
@@ -160,7 +161,13 @@ fn transfer_exact_is_noop_for_zero_amount_or_same_party() {
 
     admin_client.mint(&holder, &321);
 
-    assert_eq!(transfer_exact(&env, &token_address, &holder, &holder, 321), Ok(()));
-    assert_eq!(transfer_exact(&env, &token_address, &holder, &holder, 0), Ok(()));
+    assert_eq!(
+        transfer_exact(&env, &token_address, &holder, &holder, 321),
+        Ok(())
+    );
+    assert_eq!(
+        transfer_exact(&env, &token_address, &holder, &holder, 0),
+        Ok(())
+    );
     assert_eq!(balance(&env, &token_address, &holder), Ok(321));
 }

@@ -964,7 +964,12 @@ pub fn store_batch_state(
     // Add to pending recoveries list
     add_to_pending_recoveries(env, batch_id);
 
-    emit_batch_event(env, symbol_short!("br_start"), batch_id, recipients.len() as u32);
+    emit_batch_event(
+        env,
+        symbol_short!("br_start"),
+        batch_id,
+        recipients.len() as u32,
+    );
 
     Ok(batch_id)
 }
@@ -1068,9 +1073,12 @@ pub fn mark_item_success(env: &Env, batch_id: u64, item_index: u32) -> Result<()
 
     let mut item = state.items.get(item_index).unwrap();
     item.status = BatchItemStatus::Success;
-    state.successful_amount = state.successful_amount.checked_add(item.amount).unwrap_or_else(|| {
-        panic!("Successful amount overflow");
-    });
+    state.successful_amount = state
+        .successful_amount
+        .checked_add(item.amount)
+        .unwrap_or_else(|| {
+            panic!("Successful amount overflow");
+        });
     state.items.set(item_index, item);
 
     update_batch_state(env, &state);
@@ -1198,11 +1206,7 @@ pub fn is_recovery_expired(env: &Env, batch_id: u64) -> bool {
 /// Increment retry count for an item.
 ///
 /// Returns an error if max retries exceeded.
-pub fn increment_retry_count(
-    env: &Env,
-    batch_id: u64,
-    item_index: u32,
-) -> Result<(), u32> {
+pub fn increment_retry_count(env: &Env, batch_id: u64, item_index: u32) -> Result<(), u32> {
     let config = get_batch_recovery_config(env);
     let mut state = get_batch_state(env, batch_id).ok_or(ERR_BATCH_NOT_FOUND)?;
 
@@ -1224,11 +1228,7 @@ pub fn increment_retry_count(
 ///
 /// # Security
 /// Caller must verify that `caller` is the authorized key for this batch.
-pub fn cancel_batch_recovery(
-    env: &Env,
-    batch_id: u64,
-    caller: &Address,
-) -> Result<(), u32> {
+pub fn cancel_batch_recovery(env: &Env, batch_id: u64, caller: &Address) -> Result<(), u32> {
     let mut state = get_batch_state(env, batch_id).ok_or(ERR_BATCH_NOT_FOUND)?;
 
     // Verify authorization
@@ -1300,11 +1300,7 @@ pub struct RollbackResult {
 ///
 /// # Security
 /// Caller must verify authorization before executing rollback.
-pub fn prepare_rollback(
-    env: &Env,
-    batch_id: u64,
-    caller: &Address,
-) -> Result<RollbackResult, u32> {
+pub fn prepare_rollback(env: &Env, batch_id: u64, caller: &Address) -> Result<RollbackResult, u32> {
     let state = get_batch_state(env, batch_id).ok_or(ERR_BATCH_NOT_FOUND)?;
 
     // Verify authorization
@@ -1368,19 +1364,27 @@ pub fn verify_batch_integrity(env: &Env, batch_id: u64) -> bool {
         let item = state.items.get(i).unwrap();
         match item.status {
             BatchItemStatus::Success => {
-                calculated_successful = calculated_successful.checked_add(item.amount).unwrap_or_else(|| {
-                    panic!("Amount overflow in integrity check");
-                });
+                calculated_successful = calculated_successful
+                    .checked_add(item.amount)
+                    .unwrap_or_else(|| {
+                        panic!("Amount overflow in integrity check");
+                    });
             }
             BatchItemStatus::Pending => {
-                calculated_pending = calculated_pending.checked_add(item.amount).unwrap_or_else(|| {
-                    panic!("Amount overflow in integrity check");
-                });
+                calculated_pending =
+                    calculated_pending
+                        .checked_add(item.amount)
+                        .unwrap_or_else(|| {
+                            panic!("Amount overflow in integrity check");
+                        });
             }
             BatchItemStatus::Failed | BatchItemStatus::RolledBack => {
-                calculated_failed = calculated_failed.checked_add(item.amount).unwrap_or_else(|| {
-                    panic!("Amount overflow in integrity check");
-                });
+                calculated_failed =
+                    calculated_failed
+                        .checked_add(item.amount)
+                        .unwrap_or_else(|| {
+                            panic!("Amount overflow in integrity check");
+                        });
             }
         }
     }
